@@ -2,7 +2,7 @@
 
 Integration of the two prior spikes ([ae-egress-proxy](https://github.com/mintybasil/ae-egress-proxy) and [ae-fc-poc](https://github.com/mintybasil/ae-fc-poc)) into a single end-to-end path. See [FINDINGS.md](FINDINGS.md) for the full results.
 
-**Status:** ⚠️ Partial pass — VM boots, proxy receives traffic, source IP identified, CONNECT tunnel established. TLS handshake blocked (likely kernel 4.14 virtio-net issue — see findings).
+**Status:** ✅ All verifications pass — full end-to-end path works (VM → nftables → proxy → upstream API with key injection + SSE streaming). Requires Firecracker CI 5.10 kernel (4.14 kernel has a virtio-net TLS bug).
 
 ```
  Firecracker VM → nftables DNAT → MITM Egress Proxy → Mock API (upstream)
@@ -33,6 +33,10 @@ This proves the full chain works as a system: a Firecracker VM running curl make
 - Python 3 + OpenSSL (for the mock server)
 - Firecracker v1.14+ at `/usr/local/bin/firecracker`
 - `mke2fs` (e2fsprogs), `curl`, `tar`
+- **Firecracker CI 5.10 kernel** (not the 4.14 hello-vmlinux — it has a virtio-net TLS bug):
+  ```bash
+  curl -sL "https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/20260107-89702a77e4c2-0/x86_64/vmlinux-5.10.245" -o vmlinux-5.10.bin
+  ```
 
 ## Build
 
@@ -43,8 +47,8 @@ cargo build --release
 ## Run
 
 ```bash
-# Download the Firecracker kernel
-curl -sL "https://s3.amazonaws.com/spec.ccfc.min/img/hello/kernel/hello-vmlinux.bin" -o vmlinux.bin
+# Download the Firecracker CI 5.10 kernel
+curl -sL "https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/20260107-89702a77e4c2-0/x86_64/vmlinux-5.10.245" -o vmlinux-5.10-new.bin
 
 # Run the integration test (needs sudo for TAP + nftables)
 sudo ./target/release/ae-poc

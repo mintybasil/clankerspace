@@ -45,7 +45,7 @@ const PROXY_PORT: u16 = 9999;
 const MOCK_PORT: u16 = 9443;
 
 // --- File paths ---
-const KERNEL_PATH: &str = "vmlinux.bin";
+const KERNEL_PATH: &str = "vmlinux-5.10-new.bin";
 const ROOTFS_PATH: &str = "rootfs.ext4";
 const CA_PATH: &str = "proxy-ca.pem";
 const BUILD_ROOTFS_SCRIPT: &str = "build-rootfs.sh";
@@ -332,7 +332,7 @@ async fn launch_vm(
         .context("Failed to create rootfs resource")?;
 
     let boot_args = format!(
-        "console=ttyS0 reboot=k panic=1 pci=off ip={vm_ip}::{host_ip}:255.255.255.0::eth0:off",
+        "console=ttyS0 reboot=k panic=1 root=/dev/vda ro ip={vm_ip}::{host_ip}:255.255.255.0::eth0:off",
         vm_ip = VM_IP,
         host_ip = HOST_TAP_IP,
     );
