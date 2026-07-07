@@ -1,0 +1,10 @@
+/target
+/Cargo.lock
+*.pem
+*.crt
+*.key
+*.ext4
+*.bin
+*.sock
+.env
+/rootfs-build/
