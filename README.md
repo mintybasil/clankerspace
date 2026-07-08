@@ -113,8 +113,72 @@ src/
 ├── proxy.rs         — MITM TLS proxy, CONNECT handler, key injection (from ae-egress-proxy)
 ├── stream.rs        — Bidirectional byte copy with flush (from ae-egress-proxy)
 └── mock_server.py   — Mock HTTPS API server (simulates LLM API)
-build-rootfs.sh      — Builds Alpine rootfs with CA cert + curl + test script
+build-rootfs.sh      — Builds Alpine rootfs for integration test (PoC-specific)
+build-image.sh       — Reusable image builder (step #3: image building pipeline)
+images/
+├── EXAMPLES.md          — Image build command examples
+└── agent-init-template.sh — Custom agent init script template
 ```
+
+## Image Builder
+
+`build-image.sh` is a standalone, reusable script for building Firecracker rootfs images. It generalizes the PoC's `build-rootfs.sh` into a production image builder.
+
+### Quick start
+
+```bash
+# Generate a proxy CA cert first (or use one from the running proxy)
+# The ae-poc binary writes one to proxy-ca.pem on startup
+
+# Build a minimal image (curl + CA cert only)
+./build-image.sh --ca-cert proxy-ca.pem --size 200M images/minimal.ext4
+
+# Build a Pi agent image (Node.js + Pi + CA cert + proxy config)
+./build-image.sh --ca-cert proxy-ca.pem --with-pi --size 500M images/pi-agent.ext4
+
+# Build with extra tools
+./build-image.sh --ca-cert proxy-ca.pem --with-pi \
+    --packages "git,jq,python3" --size 800M images/pi-dev.ext4
+```
+
+### What it installs
+
+| Component | Always | Optional | Location in rootfs |
+|---|---|---|---|
+| Alpine Linux 3.20 base | ✅ | | `/` |
+| curl + ca-certificates | ✅ | | `/usr/bin/curl` |
+| Proxy CA cert | ✅ | | `/usr/local/share/ca-certificates/ae-proxy-ca.crt` + `/etc/ssl/certs/ca-certificates.crt` |
+| Proxy env vars | ✅ | `--no-proxy` | `/etc/profile.d/proxy.sh` |
+| Serial console (ttyS0) | ✅ | | `/etc/inittab` |
+| Network config (eth0) | ✅ | | `/etc/init.d/network-config` |
+| Agent init script | ✅ | | `/etc/init.d/agent-init` |
+| Node.js + npm | | `--with-pi` | `/usr/bin/node`, `/usr/bin/npm` |
+| Pi agent harness | | `--with-pi` | `/usr/bin/pi` (via `npm install -g`) |
+| Pi packages | | `--pi-packages` | `~/.pi/agent/` |
+| Extra Alpine packages | | `--packages` | varies |
+
+### Proxy configuration
+
+The builder writes proxy environment variables to `/etc/profile.d/proxy.sh`:
+
+```sh
+export http_proxy="http://10.0.0.1:9999"
+export https_proxy="http://10.0.0.1:9999"
+export HTTP_PROXY="http://10.0.0.1:9999"
+export HTTPS_PROXY="http://10.0.0.1:9999"
+export no_proxy="localhost,127.0.0.1"
+export NO_PROXY="localhost,127.0.0.1"
+```
+
+Pi and curl respect these environment variables. When Pi makes an API call to `api.openai.com`, curl uses the proxy via CONNECT. The proxy MITMs TLS, strips the placeholder key, injects the real key, and forwards upstream. Pi doesn't need to know about the injection mechanism.
+
+### Custom agent init
+
+The default `/etc/init.d/agent-init` prints a "ready" message and starts Pi if installed. For custom agent workflows, inject a custom init script at VM launch time via fctools `ResourceSystem` (replacing `/etc/init.d/agent-init`). See [`images/agent-init-template.sh`](images/agent-init-template.sh) for a template.
+
+### Build examples
+
+See [`images/EXAMPLES.md`](images/EXAMPLES.md) for 6 example build commands covering minimal, Pi, dev tools, custom proxy, and no-proxy scenarios.
 
 ## Related
 
