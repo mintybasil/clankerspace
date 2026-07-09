@@ -762,3 +762,296 @@ mod tests {
         assert!(!is_allowlisted(&state, "evil.com"));
     }
 }
+
+
+#[cfg(test)]
+mod integration_tests {
+    use super::*;
+    use crate::certs::Ca;
+    use crate::session::SessionStore;
+    use crate::vault::MockSecretStore;
+    use sha2::{Sha256, Digest};
+    use std::sync::Arc;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// Start a proxy with session store on a random port, return the address.
+    async fn start_test_proxy(
+        secret_store: Arc<dyn crate::vault::SecretStore>,
+    ) -> std::net::SocketAddr {
+        let ca = Arc::new(Ca::generate().unwrap());
+        let server_config = ca.server_config(&["api.openai.com".to_string()]).unwrap();
+        let upstream_config = Ca::upstream_client_config_no_verify().unwrap();
+
+        let mut hasher = Sha256::new();
+        hasher.update(ca.ca_der.as_ref());
+        let digest = hasher.finalize();
+        let ca_fingerprint: String = digest
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<Vec<_>>()
+            .join(":");
+
+        let store = SessionStore::in_memory().unwrap();
+
+        let state = ProxyState {
+            server_config,
+            upstream_config,
+            allowlist: vec![],
+            api_key: String::new(),
+            upstream_port: 0,
+            upstream_host: String::new(),
+            expected_vm_ip: String::new(),
+            sessions: Some(store),
+            secret_store: Some(secret_store),
+            ca_cert_sha256: ca_fingerprint,
+            start_time: crate::session::now_secs(),
+        };
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            loop {
+                match listener.accept().await {
+                    Ok((stream, _)) => {
+                        let st = state.clone();
+                        tokio::spawn(async move {
+                            let _ = handle_connection(stream, st).await;
+                        });
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        addr
+    }
+
+    /// Send a raw HTTP request and return the response bytes.
+    async fn http_request(addr: std::net::SocketAddr, req: &str) -> Vec<u8> {
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        stream.write_all(req.as_bytes()).await.unwrap();
+        stream.flush().await.unwrap();
+        let mut resp = Vec::new();
+        stream.read_to_end(&mut resp).await.unwrap();
+        resp
+    }
+
+    #[tokio::test]
+    async fn test_health_endpoint() {
+        let store = Arc::new(MockSecretStore::new());
+        let addr = start_test_proxy(store).await;
+
+        let resp = http_request(
+            addr,
+            "GET /health HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        let resp_str = String::from_utf8_lossy(&resp);
+        assert!(resp_str.contains("200 OK"), "got: {resp_str}");
+        assert!(resp_str.contains("\"status\":\"ok\""));
+        assert!(resp_str.contains("\"ca_cert_sha256\""));
+        assert!(resp_str.contains("\"active_sessions\":0"));
+        assert!(resp_str.contains("\"uptime_secs\""));
+    }
+
+    #[tokio::test]
+    async fn test_create_and_get_session() {
+        let secret_store = Arc::new(MockSecretStore::new());
+        secret_store.insert("vault://secret/data/test-key", "sk-test-key");
+        let addr = start_test_proxy(secret_store).await;
+
+        // POST /sessions
+        let body = r#"{"session_id":"sess_test1","source_ip":"10.0.1.42","allowlist":[{"domain":"api.openai.com","mode":"mitm","credential_ref":"vault://secret/data/test-key"}]}"#;
+        let req = format!(
+            "POST /sessions HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        let resp = http_request(addr, &req).await;
+        let resp_str = String::from_utf8_lossy(&resp);
+        assert!(resp_str.contains("201 Created"), "got: {resp_str}");
+        assert!(resp_str.contains("sess_test1"));
+        assert!(resp_str.contains("10.0.1.42"));
+
+        // GET /sessions/sess_test1
+        let resp = http_request(
+            addr,
+            "GET /sessions/sess_test1 HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        let resp_str = String::from_utf8_lossy(&resp);
+        assert!(resp_str.contains("200 OK"), "got: {resp_str}");
+        assert!(resp_str.contains("sess_test1"));
+
+        // GET /sessions
+        let resp = http_request(
+            addr,
+            "GET /sessions HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        let resp_str = String::from_utf8_lossy(&resp);
+        assert!(resp_str.contains("200 OK"));
+        assert!(resp_str.contains("sess_test1"));
+    }
+
+    #[tokio::test]
+    async fn test_delete_session() {
+        let secret_store = Arc::new(MockSecretStore::new());
+        let addr = start_test_proxy(secret_store).await;
+
+        // Create
+        let body = r#"{"session_id":"sess_del","source_ip":"10.0.1.50","allowlist":[{"domain":"api.openai.com","mode":"tunnel"}]}"#;
+        let req = format!(
+            "POST /sessions HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        let _ = http_request(addr, &req).await;
+
+        // DELETE
+        let resp = http_request(
+            addr,
+            "DELETE /sessions/sess_del HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        let resp_str = String::from_utf8_lossy(&resp);
+        assert!(resp_str.contains("204"), "got: {resp_str}");
+
+        // GET should 404
+        let resp = http_request(
+            addr,
+            "GET /sessions/sess_del HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        let resp_str = String::from_utf8_lossy(&resp);
+        assert!(resp_str.contains("404"));
+        assert!(resp_str.contains("SESSION_NOT_FOUND"));
+    }
+
+    #[tokio::test]
+    async fn test_create_session_invalid_credential_ref() {
+        let secret_store = Arc::new(MockSecretStore::new());
+        let addr = start_test_proxy(secret_store).await;
+
+        let body = r#"{"session_id":"sess_bad","source_ip":"10.0.1.60","allowlist":[{"domain":"api.openai.com","mode":"mitm","credential_ref":"vault://secret/data/nonexistent"}]}"#;
+        let req = format!(
+            "POST /sessions HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        let resp = http_request(addr, &req).await;
+        let resp_str = String::from_utf8_lossy(&resp);
+        assert!(resp_str.contains("422"), "got: {resp_str}");
+        assert!(resp_str.contains("CREDENTIAL_REF_INVALID"));
+    }
+
+    #[tokio::test]
+    async fn test_create_session_duplicate() {
+        let secret_store = Arc::new(MockSecretStore::new());
+        let addr = start_test_proxy(secret_store).await;
+
+        let body = r#"{"session_id":"sess_dup","source_ip":"10.0.1.70","allowlist":[{"domain":"api.openai.com","mode":"tunnel"}]}"#;
+        let req = format!(
+            "POST /sessions HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        let _ = http_request(addr, &req).await;
+
+        // Second create with same ID
+        let body2 = r#"{"session_id":"sess_dup","source_ip":"10.0.1.71","allowlist":[{"domain":"api.openai.com","mode":"tunnel"}]}"#;
+        let req2 = format!(
+            "POST /sessions HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body2.len(),
+            body2
+        );
+        let resp = http_request(addr, &req2).await;
+        let resp_str = String::from_utf8_lossy(&resp);
+        assert!(resp_str.contains("409"), "got: {resp_str}");
+        assert!(resp_str.contains("SESSION_EXISTS"));
+    }
+
+    #[tokio::test]
+    async fn test_connect_unregistered_ip_403() {
+        let secret_store = Arc::new(MockSecretStore::new());
+        let addr = start_test_proxy(secret_store).await;
+
+        let resp = http_request(
+            addr,
+            "CONNECT api.openai.com:443 HTTP/1.1\r\nHost: api.openai.com:443\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        let resp_str = String::from_utf8_lossy(&resp);
+        assert!(resp_str.contains("403"), "got: {resp_str}");
+    }
+
+    #[tokio::test]
+    async fn test_connect_non_allowlisted_domain_403() {
+        let secret_store = Arc::new(MockSecretStore::new());
+        let addr = start_test_proxy(secret_store).await;
+
+        // Register a session for 127.0.0.1 (test connects from localhost)
+        let body = r#"{"session_id":"sess_allow","source_ip":"127.0.0.1","allowlist":[{"domain":"api.openai.com","mode":"tunnel"}]}"#;
+        let req = format!(
+            "POST /sessions HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        let _ = http_request(addr, &req).await;
+
+        // CONNECT to a non-allowlisted domain
+        let resp = http_request(
+            addr,
+            "CONNECT evil.com:443 HTTP/1.1\r\nHost: evil.com:443\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        let resp_str = String::from_utf8_lossy(&resp);
+        assert!(resp_str.contains("403"), "got: {resp_str}");
+    }
+
+    #[tokio::test]
+    async fn test_full_lifecycle() {
+        let secret_store = Arc::new(MockSecretStore::new());
+        let addr = start_test_proxy(secret_store).await;
+
+        // 1. Register session
+        let body = r#"{"session_id":"sess_life","source_ip":"127.0.0.1","allowlist":[{"domain":"api.openai.com","mode":"tunnel"}]}"#;
+        let req = format!(
+            "POST /sessions HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        let resp = http_request(addr, &req).await;
+        assert!(String::from_utf8_lossy(&resp).contains("201"));
+
+        // 2. CONNECT to allowlisted domain should NOT get 403
+        let resp = http_request(
+            addr,
+            "CONNECT api.openai.com:443 HTTP/1.1\r\nHost: api.openai.com:443\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        let resp_str = String::from_utf8_lossy(&resp);
+        assert!(
+            !resp_str.starts_with("HTTP/1.1 403"),
+            "CONNECT should not be 403 after registration: {resp_str}"
+        );
+
+        // 3. Delete session
+        let resp = http_request(
+            addr,
+            "DELETE /sessions/sess_life HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        assert!(String::from_utf8_lossy(&resp).contains("204"));
+
+        // 4. CONNECT should now fail with 403
+        let resp = http_request(
+            addr,
+            "CONNECT api.openai.com:443 HTTP/1.1\r\nHost: api.openai.com:443\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        let resp_str = String::from_utf8_lossy(&resp);
+        assert!(resp_str.contains("403"), "CONNECT should be 403 after delete: {resp_str}");
+    }
+}
