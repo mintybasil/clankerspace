@@ -87,6 +87,18 @@ async fn main() -> Result<()> {
     let server_config = ca.server_config(&allowlist)?;
     let upstream_config = certs::Ca::upstream_client_config_no_verify()?;
 
+    // Compute CA cert SHA-256 fingerprint for health endpoint
+    let ca_cert_sha256 = {
+        use sha2::{Sha256, Digest};
+        let mut hasher = Sha256::new();
+        hasher.update(ca.ca_der.as_ref());
+        hasher.finalize()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<Vec<_>>()
+            .join(":")
+    };
+
     let proxy_state = proxy::ProxyState {
         server_config,
         upstream_config,
@@ -96,6 +108,9 @@ async fn main() -> Result<()> {
         upstream_host: "127.0.0.1".to_string(), // mock server runs locally
         expected_vm_ip: VM_IP.to_string(),
         sessions: None, // PoC mode — no session store
+        secret_store: None,
+        ca_cert_sha256,
+        start_time: session::now_secs(),
     };
 
     let proxy_addr: SocketAddr = format!("0.0.0.0:{PROXY_PORT}").parse()?;
