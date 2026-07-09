@@ -8,3 +8,4 @@
 *.sock
 .env
 /rootfs-build/
+.idea/

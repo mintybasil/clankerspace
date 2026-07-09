@@ -11,11 +11,11 @@ use std::time::Duration;
 use bytes::Bytes;
 use http_body_util::Full;
 use hyper::{Request, Response, StatusCode};
+use hyper_util::rt::TokioIo;
 use rustls::pki_types::ServerName;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio_rustls::{TlsAcceptor, TlsConnector};
-use hyper_util::rt::TokioIo;
 
 use crate::stream::copy_bidirectional;
 
@@ -54,7 +54,11 @@ pub async fn handle_connection(stream: TcpStream, state: ProxyState) -> Result<(
         log(&format!(
             "CONNECT from {} — {}",
             ip,
-            if is_vm { "✓ VM source IP (session identified)" } else { "⚠ unexpected source IP" }
+            if is_vm {
+                "✓ VM source IP (session identified)"
+            } else {
+                "⚠ unexpected source IP"
+            }
         ));
     }
 
@@ -85,7 +89,10 @@ impl ProxyService {
         };
 
         if !is_allowlisted(&self.state, &host) {
-            log(&format!("DROP: {host} not in allowlist (peer={:?})", self.peer));
+            log(&format!(
+                "DROP: {host} not in allowlist (peer={:?})",
+                self.peer
+            ));
             let mut resp = Response::new(Full::new(Bytes::new()));
             *resp.status_mut() = StatusCode::FORBIDDEN;
             return Ok(resp);
@@ -113,7 +120,9 @@ impl ProxyService {
             let mut tls_client = match tokio::time::timeout(
                 Duration::from_secs(10),
                 acceptor.accept(upgraded),
-            ).await {
+            )
+            .await
+            {
                 Ok(Ok(t)) => {
                     log(&format!("MITM: TLS handshake with client OK for {host}"));
                     t
@@ -144,7 +153,9 @@ impl ProxyService {
             let tcp_up = match tokio::net::TcpStream::connect(&upstream_addr).await {
                 Ok(s) => s,
                 Err(e) => {
-                    log(&format!("upstream TCP connect to {upstream_addr} failed: {e}"));
+                    log(&format!(
+                        "upstream TCP connect to {upstream_addr} failed: {e}"
+                    ));
                     return;
                 }
             };
@@ -177,7 +188,10 @@ impl ProxyService {
             };
 
             let forwarded = rewrite_request(&req_bytes, &self.state, &host);
-            log(&format!("MITM: forwarding {host} request ({} bytes)", forwarded.len()));
+            log(&format!(
+                "MITM: forwarding {host} request ({} bytes)",
+                forwarded.len()
+            ));
 
             if let Err(e) = tls_upstream.write_all(&forwarded).await {
                 log(&format!("write to upstream {host}: {e}"));
@@ -212,9 +226,8 @@ impl hyper::service::Service<Request<hyper::body::Incoming>> for ProxyService {
             if method != hyper::Method::CONNECT {
                 let mut resp = Response::new(Full::new(Bytes::new()));
                 *resp.status_mut() = StatusCode::METHOD_NOT_ALLOWED;
-                *resp.body_mut() = Full::new(Bytes::from_static(
-                    b"ae-poc: only CONNECT is supported\n",
-                ));
+                *resp.body_mut() =
+                    Full::new(Bytes::from_static(b"ae-poc: only CONNECT is supported\n"));
                 return Ok(resp);
             }
 
@@ -289,10 +302,10 @@ where
 
 fn extract_content_length(headers: &str) -> Option<usize> {
     for line in headers.lines() {
-        if let Some((name, val)) = line.split_once(':') {
-            if name.trim().eq_ignore_ascii_case("content-length") {
-                return val.trim().parse().ok();
-            }
+        if let Some((name, val)) = line.split_once(':')
+            && name.trim().eq_ignore_ascii_case("content-length")
+        {
+            return val.trim().parse().ok();
         }
     }
     None
@@ -331,10 +344,10 @@ fn rewrite_request(raw: &[u8], state: &ProxyState, host: &str) -> Vec<u8> {
     });
 
     for line in lines.iter_mut() {
-        if let Some((name, _)) = line.split_once(':') {
-            if name.trim().eq_ignore_ascii_case("host") {
-                *line = format!("Host: {host}");
-            }
+        if let Some((name, _)) = line.split_once(':')
+            && name.trim().eq_ignore_ascii_case("host")
+        {
+            *line = format!("Host: {host}");
         }
     }
 
@@ -354,14 +367,24 @@ pub fn log(msg: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::certs::Ca;
+    use crate::certs::{Ca, CertError};
+
+    fn upstream_client_config() -> Result<Arc<rustls::ClientConfig>, CertError> {
+        let roots = rustls::RootCertStore {
+            roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
+        };
+        let config = rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        Ok(Arc::new(config))
+    }
 
     fn test_state() -> ProxyState {
         let ca = Arc::new(Ca::generate().unwrap());
         let server_config = ca.server_config(&["api.openai.com".to_string()]).unwrap();
         ProxyState {
             server_config,
-            upstream_config: Ca::upstream_client_config().unwrap(),
+            upstream_config: upstream_client_config().unwrap(),
             allowlist: vec!["api.openai.com".to_string()],
             api_key: "sk-REAL-KEY".into(),
             upstream_port: 0,

@@ -9,11 +9,13 @@
 
 use std::sync::Arc;
 
-use rcgen::{CertificateParams, CertifiedIssuer, DistinguishedName, DnType, KeyPair, PKCS_ECDSA_P256_SHA256};
+use rcgen::{
+    CertificateParams, CertifiedIssuer, DistinguishedName, DnType, KeyPair, PKCS_ECDSA_P256_SHA256,
+};
+use rustls::ServerConfig;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use rustls::server::ResolvesServerCertUsingSni;
 use rustls::sign::CertifiedKey;
-use rustls::ServerConfig;
 
 #[derive(Debug, thiserror::Error)]
 pub enum CertError {
@@ -40,8 +42,8 @@ impl Ca {
         let key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256)
             .map_err(|e| CertError::KeyGen(e.to_string()))?;
 
-        let mut params = CertificateParams::new(Vec::new())
-            .map_err(|e| CertError::CaGen(e.to_string()))?;
+        let mut params =
+            CertificateParams::new(Vec::new()).map_err(|e| CertError::CaGen(e.to_string()))?;
         params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
         params.distinguished_name = {
             let mut dn = DistinguishedName::new();
@@ -50,11 +52,12 @@ impl Ca {
             dn
         };
         params.not_before = time::OffsetDateTime::now_utc() - time::Duration::days(1);
-        params.not_after =
-            time::OffsetDateTime::now_utc().checked_add(time::Duration::days(3650)).unwrap();
+        params.not_after = time::OffsetDateTime::now_utc()
+            .checked_add(time::Duration::days(3650))
+            .unwrap();
 
-        let issuer =
-            CertifiedIssuer::self_signed(params, key).map_err(|e| CertError::CaGen(e.to_string()))?;
+        let issuer = CertifiedIssuer::self_signed(params, key)
+            .map_err(|e| CertError::CaGen(e.to_string()))?;
         let ca_der = issuer.as_ref().der().clone();
 
         Ok(Self { issuer, ca_der })
@@ -76,8 +79,9 @@ impl Ca {
             dn
         };
         params.not_before = time::OffsetDateTime::now_utc() - time::Duration::minutes(1);
-        params.not_after =
-            time::OffsetDateTime::now_utc().checked_add(time::Duration::days(7)).unwrap();
+        params.not_after = time::OffsetDateTime::now_utc()
+            .checked_add(time::Duration::days(7))
+            .unwrap();
 
         let leaf = params
             .signed_by(&leaf_key, &self.issuer)
@@ -102,16 +106,6 @@ impl Ca {
         let config = ServerConfig::builder()
             .with_no_client_auth()
             .with_cert_resolver(Arc::new(resolver));
-        Ok(Arc::new(config))
-    }
-
-    pub fn upstream_client_config() -> Result<Arc<rustls::ClientConfig>, CertError> {
-        let roots = rustls::RootCertStore {
-            roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
-        };
-        let config = rustls::ClientConfig::builder()
-            .with_root_certificates(roots)
-            .with_no_client_auth();
         Ok(Arc::new(config))
     }
 
