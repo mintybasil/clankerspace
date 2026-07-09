@@ -302,10 +302,10 @@ where
 
 fn extract_content_length(headers: &str) -> Option<usize> {
     for line in headers.lines() {
-        if let Some((name, val)) = line.split_once(':') {
-            if name.trim().eq_ignore_ascii_case("content-length") {
-                return val.trim().parse().ok();
-            }
+        if let Some((name, val)) = line.split_once(':')
+            && name.trim().eq_ignore_ascii_case("content-length")
+        {
+            return val.trim().parse().ok();
         }
     }
     None
@@ -344,10 +344,10 @@ fn rewrite_request(raw: &[u8], state: &ProxyState, host: &str) -> Vec<u8> {
     });
 
     for line in lines.iter_mut() {
-        if let Some((name, _)) = line.split_once(':') {
-            if name.trim().eq_ignore_ascii_case("host") {
-                *line = format!("Host: {host}");
-            }
+        if let Some((name, _)) = line.split_once(':')
+            && name.trim().eq_ignore_ascii_case("host")
+        {
+            *line = format!("Host: {host}");
         }
     }
 
@@ -367,14 +367,24 @@ pub fn log(msg: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::certs::Ca;
+    use crate::certs::{Ca, CertError};
+
+    fn upstream_client_config() -> Result<Arc<rustls::ClientConfig>, CertError> {
+        let roots = rustls::RootCertStore {
+            roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
+        };
+        let config = rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        Ok(Arc::new(config))
+    }
 
     fn test_state() -> ProxyState {
         let ca = Arc::new(Ca::generate().unwrap());
         let server_config = ca.server_config(&["api.openai.com".to_string()]).unwrap();
         ProxyState {
             server_config,
-            upstream_config: Ca::upstream_client_config().unwrap(),
+            upstream_config: upstream_client_config().unwrap(),
             allowlist: vec!["api.openai.com".to_string()],
             api_key: "sk-REAL-KEY".into(),
             upstream_port: 0,

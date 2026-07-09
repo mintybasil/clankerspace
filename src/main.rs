@@ -142,7 +142,7 @@ async fn main() -> Result<()> {
 
     // Capture serial output
     let pipes = vm.take_pipes().ok();
-    if let Some(mut pipes) = pipes {
+    if let Some(pipes) = pipes {
         use futures_util::AsyncReadExt;
         let mut buf = vec![0u8; 4096];
         let mut stdout = pipes.stdout;
@@ -206,7 +206,7 @@ async fn main() -> Result<()> {
 async fn build_rootfs() -> Result<()> {
     let script_path = PathBuf::from(BUILD_ROOTFS_SCRIPT)
         .canonicalize()
-        .context(format!("build-rootfs.sh not found"))?;
+        .context("build-rootfs.sh not found")?;
 
     let output = tokio::process::Command::new("bash")
         .arg(&script_path)
