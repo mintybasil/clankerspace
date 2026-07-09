@@ -24,18 +24,22 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use fctools::process_spawner::DirectProcessSpawner;
 use fctools::runtime::tokio::TokioRuntime;
 use fctools::vm::configuration::{InitMethod, VmConfiguration};
 use fctools::vm::models::{BootSource, Drive, MachineConfiguration, NetworkInterface};
-use fctools::vm::{Vm, configuration::VmConfigurationData, shutdown::{VmShutdownAction, VmShutdownMethod}};
+use fctools::vm::{
+    Vm,
+    configuration::VmConfigurationData,
+    shutdown::{VmShutdownAction, VmShutdownMethod},
+};
 use fctools::vmm::arguments::{VmmApiSocket, VmmArguments};
 use fctools::vmm::executor::unrestricted::UnrestrictedVmmExecutor;
 use fctools::vmm::installation::VmmInstallation;
 use fctools::vmm::ownership::VmmOwnershipModel;
-use fctools::vmm::resource::{MovedResourceType, ResourceType};
 use fctools::vmm::resource::system::ResourceSystem;
+use fctools::vmm::resource::{MovedResourceType, ResourceType};
 
 // --- Network constants ---
 const VM_IP: &str = "10.0.0.2";
@@ -124,9 +128,11 @@ async fn main() -> Result<()> {
 
     // -- Phase 6: Launch the Firecracker VM --
     println!("[6/7] Launching Firecracker VM...");
-    let kernel_path = PathBuf::from(KERNEL_PATH).canonicalize()
+    let kernel_path = PathBuf::from(KERNEL_PATH)
+        .canonicalize()
         .context(format!("Kernel file '{KERNEL_PATH}' not found"))?;
-    let rootfs_path = PathBuf::from(ROOTFS_PATH).canonicalize()
+    let rootfs_path = PathBuf::from(ROOTFS_PATH)
+        .canonicalize()
         .context(format!("Rootfs file '{ROOTFS_PATH}' not found"))?;
     println!("      Kernel: {}", kernel_path.display());
     println!("      Rootfs: {}", rootfs_path.display());
@@ -187,7 +193,9 @@ async fn main() -> Result<()> {
     println!("Key verification points:");
     println!("  - Proxy logs should show 'CONNECT from {VM_IP} — ✓ VM source IP'");
     println!("  - VM should show 'HTTP/1.1 200' response from the mock API");
-    println!("  - Mock server should show 'OK: Received auth header: Bearer sk-INJECTED-BY-PROXY...'");
+    println!(
+        "  - Mock server should show 'OK: Received auth header: Bearer sk-INJECTED-BY-PROXY...'"
+    );
     println!("═══════════════════════════════════════════════════════════");
 
     Ok(())
@@ -196,7 +204,8 @@ async fn main() -> Result<()> {
 /// Build the rootfs using the external build-rootfs.sh script.
 /// The script bakes the proxy CA cert into the rootfs.
 async fn build_rootfs() -> Result<()> {
-    let script_path = PathBuf::from(BUILD_ROOTFS_SCRIPT).canonicalize()
+    let script_path = PathBuf::from(BUILD_ROOTFS_SCRIPT)
+        .canonicalize()
         .context(format!("build-rootfs.sh not found"))?;
 
     let output = tokio::process::Command::new("bash")
@@ -242,23 +251,53 @@ fn start_mock_server() -> tokio::task::JoinHandle<()> {
 // --- TAP interface management (from ae-fc-poc) ---
 
 async fn setup_tap_interface() -> Result<()> {
-    run_cmd("sudo", &["ip", "tuntap", "add", "dev", TAP_NAME, "mode", "tap"]).await?;
-    run_cmd("sudo", &["ip", "addr", "add", &format!("{HOST_TAP_IP}/24"), "dev", TAP_NAME]).await?;
+    run_cmd(
+        "sudo",
+        &["ip", "tuntap", "add", "dev", TAP_NAME, "mode", "tap"],
+    )
+    .await?;
+    run_cmd(
+        "sudo",
+        &[
+            "ip",
+            "addr",
+            "add",
+            &format!("{HOST_TAP_IP}/24"),
+            "dev",
+            TAP_NAME,
+        ],
+    )
+    .await?;
     run_cmd("sudo", &["ip", "link", "set", "dev", TAP_NAME, "up"]).await?;
     // Disable checksum offload — Firecracker's virtio-net doesn't support
     // hardware checksum offload, and the 4.14 kernel may not handle it
     // correctly for TLS-sized packets
-    run_cmd("sudo", &["ethtool", "-K", TAP_NAME, "tx", "off", "rx", "off"]).await.ok();
+    run_cmd(
+        "sudo",
+        &["ethtool", "-K", TAP_NAME, "tx", "off", "rx", "off"],
+    )
+    .await
+    .ok();
     // Disable rp_filter — required for DNAT'd return traffic
     let rp_filter_path = format!("/proc/sys/net/ipv4/conf/{TAP_NAME}/rp_filter");
     run_cmd("sudo", &["sh", "-c", &format!("echo 0 > {rp_filter_path}")]).await?;
-    run_cmd("sudo", &["sh", "-c", "echo 0 > /proc/sys/net/ipv4/conf/all/rp_filter"]).await?;
+    run_cmd(
+        "sudo",
+        &["sh", "-c", "echo 0 > /proc/sys/net/ipv4/conf/all/rp_filter"],
+    )
+    .await?;
     Ok(())
 }
 
 async fn cleanup_tap_interface() -> Result<()> {
-    run_cmd("sudo", &["ip", "link", "set", "dev", TAP_NAME, "down"]).await.ok();
-    run_cmd("sudo", &["ip", "tuntap", "del", "dev", TAP_NAME, "mode", "tap"]).await?;
+    run_cmd("sudo", &["ip", "link", "set", "dev", TAP_NAME, "down"])
+        .await
+        .ok();
+    run_cmd(
+        "sudo",
+        &["ip", "tuntap", "del", "dev", TAP_NAME, "mode", "tap"],
+    )
+    .await?;
     Ok(())
 }
 
@@ -294,7 +333,11 @@ table ip ae-poc {{
 }
 
 async fn cleanup_nftables() -> Result<()> {
-    run_cmd("sudo", &["/usr/sbin/nft", "delete", "table", "ip", "ae-poc"]).await?;
+    run_cmd(
+        "sudo",
+        &["/usr/sbin/nft", "delete", "table", "ip", "ae-poc"],
+    )
+    .await?;
     Ok(())
 }
 
@@ -313,9 +356,8 @@ async fn launch_vm(
     let api_socket_path = PathBuf::from("/tmp/ae-poc-api.sock");
     std::fs::remove_file(&api_socket_path).ok();
 
-    let executor = UnrestrictedVmmExecutor::new(
-        VmmArguments::new(VmmApiSocket::Enabled(api_socket_path)),
-    );
+    let executor =
+        UnrestrictedVmmExecutor::new(VmmArguments::new(VmmApiSocket::Enabled(api_socket_path)));
 
     let resource_system = ResourceSystem::new(
         DirectProcessSpawner,
@@ -384,14 +426,9 @@ async fn launch_vm(
         data: configuration_data,
     };
 
-    let mut vm = Vm::prepare(
-        executor,
-        resource_system,
-        installation,
-        configuration,
-    )
-    .await
-    .context("Failed to prepare VM")?;
+    let mut vm = Vm::prepare(executor, resource_system, installation, configuration)
+        .await
+        .context("Failed to prepare VM")?;
 
     println!("      VM prepared, starting boot...");
     vm.start(Duration::from_secs(10))

@@ -11,11 +11,11 @@ use std::time::Duration;
 use bytes::Bytes;
 use http_body_util::Full;
 use hyper::{Request, Response, StatusCode};
+use hyper_util::rt::TokioIo;
 use rustls::pki_types::ServerName;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio_rustls::{TlsAcceptor, TlsConnector};
-use hyper_util::rt::TokioIo;
 
 use crate::stream::copy_bidirectional;
 
@@ -54,7 +54,11 @@ pub async fn handle_connection(stream: TcpStream, state: ProxyState) -> Result<(
         log(&format!(
             "CONNECT from {} — {}",
             ip,
-            if is_vm { "✓ VM source IP (session identified)" } else { "⚠ unexpected source IP" }
+            if is_vm {
+                "✓ VM source IP (session identified)"
+            } else {
+                "⚠ unexpected source IP"
+            }
         ));
     }
 
@@ -85,7 +89,10 @@ impl ProxyService {
         };
 
         if !is_allowlisted(&self.state, &host) {
-            log(&format!("DROP: {host} not in allowlist (peer={:?})", self.peer));
+            log(&format!(
+                "DROP: {host} not in allowlist (peer={:?})",
+                self.peer
+            ));
             let mut resp = Response::new(Full::new(Bytes::new()));
             *resp.status_mut() = StatusCode::FORBIDDEN;
             return Ok(resp);
@@ -113,7 +120,9 @@ impl ProxyService {
             let mut tls_client = match tokio::time::timeout(
                 Duration::from_secs(10),
                 acceptor.accept(upgraded),
-            ).await {
+            )
+            .await
+            {
                 Ok(Ok(t)) => {
                     log(&format!("MITM: TLS handshake with client OK for {host}"));
                     t
@@ -144,7 +153,9 @@ impl ProxyService {
             let tcp_up = match tokio::net::TcpStream::connect(&upstream_addr).await {
                 Ok(s) => s,
                 Err(e) => {
-                    log(&format!("upstream TCP connect to {upstream_addr} failed: {e}"));
+                    log(&format!(
+                        "upstream TCP connect to {upstream_addr} failed: {e}"
+                    ));
                     return;
                 }
             };
@@ -177,7 +188,10 @@ impl ProxyService {
             };
 
             let forwarded = rewrite_request(&req_bytes, &self.state, &host);
-            log(&format!("MITM: forwarding {host} request ({} bytes)", forwarded.len()));
+            log(&format!(
+                "MITM: forwarding {host} request ({} bytes)",
+                forwarded.len()
+            ));
 
             if let Err(e) = tls_upstream.write_all(&forwarded).await {
                 log(&format!("write to upstream {host}: {e}"));
@@ -212,9 +226,8 @@ impl hyper::service::Service<Request<hyper::body::Incoming>> for ProxyService {
             if method != hyper::Method::CONNECT {
                 let mut resp = Response::new(Full::new(Bytes::new()));
                 *resp.status_mut() = StatusCode::METHOD_NOT_ALLOWED;
-                *resp.body_mut() = Full::new(Bytes::from_static(
-                    b"ae-poc: only CONNECT is supported\n",
-                ));
+                *resp.body_mut() =
+                    Full::new(Bytes::from_static(b"ae-poc: only CONNECT is supported\n"));
                 return Ok(resp);
             }
 
