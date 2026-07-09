@@ -12,6 +12,7 @@ use std::sync::Mutex;
 
 /// Error returned when a credential reference cannot be resolved.
 #[derive(Debug, thiserror::Error)]
+#[allow(dead_code)]
 pub enum SecretStoreError {
     #[error("credential ref not found: {0}")]
     NotFound(String),
@@ -30,15 +31,18 @@ pub trait SecretStore: Send + Sync {
 
 /// Mock secret store for tests. Keys are pre-configured in a HashMap.
 #[derive(Debug, Default)]
+#[allow(dead_code)]
 pub struct MockSecretStore {
     keys: Mutex<HashMap<String, String>>,
 }
 
 impl MockSecretStore {
+    #[allow(dead_code)]
     pub fn new() -> Self {
         Self::default()
     }
 
+    #[allow(dead_code)]
     pub fn insert(&self, credential_ref: &str, key: &str) {
         self.keys
             .lock()

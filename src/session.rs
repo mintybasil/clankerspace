@@ -354,6 +354,7 @@ impl SessionStore {
     }
 
     /// Record a request for a session (updates in-memory stats only).
+    #[allow(dead_code)]
     pub fn record_stats(&self, session_id: &str, kind: &str, bytes_up: u64, bytes_down: u64) {
         let mut stats = self.stats.lock().unwrap();
         let entry = stats.entry(session_id.to_string()).or_default();
@@ -720,7 +721,9 @@ mod tests {
     #[test]
     fn test_record_and_get_stats() {
         let store = SessionStore::in_memory().unwrap();
-        store.create(make_session("sess_stats", "10.0.1.200")).unwrap();
+        store
+            .create(make_session("sess_stats", "10.0.1.200"))
+            .unwrap();
 
         store.record_stats("sess_stats", "mitm", 100, 200);
         store.record_stats("sess_stats", "mitm", 50, 75);
@@ -739,7 +742,9 @@ mod tests {
     #[test]
     fn test_stats_removed_on_delete() {
         let store = SessionStore::in_memory().unwrap();
-        store.create(make_session("sess_stats_del", "10.0.1.201")).unwrap();
+        store
+            .create(make_session("sess_stats_del", "10.0.1.201"))
+            .unwrap();
         store.record_stats("sess_stats_del", "mitm", 10, 20);
         assert!(store.get_stats("sess_stats_del").is_some());
 

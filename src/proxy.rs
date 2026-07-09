@@ -255,9 +255,7 @@ impl ProxyService {
             };
 
             // Use session API key if available, otherwise fall back to global key
-            let effective_key = session_api_key
-                .as_deref()
-                .unwrap_or(&self.state.api_key);
+            let effective_key = session_api_key.as_deref().unwrap_or(&self.state.api_key);
             let forwarded = rewrite_request(&req_bytes, effective_key, &host);
             log(&format!(
                 "MITM: forwarding {host} request ({} bytes)",
@@ -427,23 +425,24 @@ async fn handle_create_session(
     let expires_at = create_req.expires_at.as_deref().and_then(parse_iso8601);
 
     // Resolve credential_refs for mitm-mode entries
-    let mut resolved_keys: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let mut resolved_keys: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
     if let Some(ref sec_store) = secret_store {
         for entry in &create_req.allowlist {
-            if entry.mode == "mitm" {
-                if let Some(ref cref) = entry.credential_ref {
-                    match sec_store.fetch(cref) {
-                        Ok(key) => {
-                            resolved_keys.insert(cref.clone(), key);
-                        }
-                        Err(e) => {
-                            return Ok(error_response_with_detail(
-                                StatusCode::UNPROCESSABLE_ENTITY,
-                                "CREDENTIAL_REF_INVALID",
-                                "failed to resolve credential reference",
-                                &e.to_string(),
-                            ));
-                        }
+            if entry.mode == "mitm"
+                && let Some(ref cref) = entry.credential_ref
+            {
+                match sec_store.fetch(cref) {
+                    Ok(key) => {
+                        resolved_keys.insert(cref.clone(), key);
+                    }
+                    Err(e) => {
+                        return Ok(error_response_with_detail(
+                            StatusCode::UNPROCESSABLE_ENTITY,
+                            "CREDENTIAL_REF_INVALID",
+                            "failed to resolve credential reference",
+                            &e.to_string(),
+                        ));
                     }
                 }
             }
@@ -465,13 +464,12 @@ async fn handle_create_session(
         Ok(()) => {
             // Store resolved API key for the session (in memory only)
             for entry in &create_req.allowlist {
-                if entry.mode == "mitm" {
-                    if let Some(ref cref) = entry.credential_ref {
-                        if let Some(key) = resolved_keys.get(cref) {
-                            store.set_api_key(&session_id, key.clone());
-                            break; // one key per session for now
-                        }
-                    }
+                if entry.mode == "mitm"
+                    && let Some(ref cref) = entry.credential_ref
+                    && let Some(key) = resolved_keys.get(cref)
+                {
+                    store.set_api_key(&session_id, key.clone());
+                    break; // one key per session for now
                 }
             }
 
@@ -763,14 +761,13 @@ mod tests {
     }
 }
 
-
 #[cfg(test)]
 mod integration_tests {
     use super::*;
     use crate::certs::Ca;
     use crate::session::SessionStore;
     use crate::vault::MockSecretStore;
-    use sha2::{Sha256, Digest};
+    use sha2::{Digest, Sha256};
     use std::sync::Arc;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -811,16 +808,11 @@ mod integration_tests {
         let addr = listener.local_addr().unwrap();
 
         tokio::spawn(async move {
-            loop {
-                match listener.accept().await {
-                    Ok((stream, _)) => {
-                        let st = state.clone();
-                        tokio::spawn(async move {
-                            let _ = handle_connection(stream, st).await;
-                        });
-                    }
-                    Err(_) => break,
-                }
+            while let Ok((stream, _)) = listener.accept().await {
+                let st = state.clone();
+                tokio::spawn(async move {
+                    let _ = handle_connection(stream, st).await;
+                });
             }
         });
 
@@ -1052,6 +1044,9 @@ mod integration_tests {
         )
         .await;
         let resp_str = String::from_utf8_lossy(&resp);
-        assert!(resp_str.contains("403"), "CONNECT should be 403 after delete: {resp_str}");
+        assert!(
+            resp_str.contains("403"),
+            "CONNECT should be 403 after delete: {resp_str}"
+        );
     }
 }

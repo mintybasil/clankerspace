@@ -91,10 +91,11 @@ async fn main() -> Result<()> {
 
     // Compute CA cert SHA-256 fingerprint for health endpoint
     let ca_cert_sha256 = {
-        use sha2::{Sha256, Digest};
+        use sha2::{Digest, Sha256};
         let mut hasher = Sha256::new();
         hasher.update(ca.ca_der.as_ref());
-        hasher.finalize()
+        hasher
+            .finalize()
             .iter()
             .map(|b| format!("{b:02x}"))
             .collect::<Vec<_>>()
