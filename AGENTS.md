@@ -44,8 +44,10 @@ Two core components plus a shared infrastructure layer:
 src/
 ├── main.rs          — integration PoC orchestrator
 ├── certs.rs         — CA + leaf cert generation (rcgen/rustls)
-├── proxy.rs         — MITM TLS proxy (hyper CONNECT upgrade)
+├── proxy.rs         — MITM TLS proxy (hyper CONNECT upgrade) + REST session API
+├── session.rs       — Session store: SQLite persistence + in-memory stats
 ├── stream.rs        — Bidirectional byte copy with per-chunk flush
+├── vault.rs         — SecretStore trait + MockSecretStore for credential fetching
 └── mock_server.py   — Mock HTTPS API for testing
 build-image.sh       — Reusable rootfs image builder
 build-rootfs.sh      — PoC-specific rootfs builder (deprecated)
@@ -89,5 +91,7 @@ sudo ./target/release/ae-poc
 | Integration (full chain) | ✅ All 10 verifications pass |
 | Image builder | ✅ Working (minimal + Pi images) |
 | API contracts | ✅ Defined |
+| Session management REST API | ✅ Implemented (POST/GET/DELETE /sessions, GET /health) |
+| Credential fetching (SecretStore) | ✅ Trait + mock; Vault impl pending |
 | Proxy productionization | 📋 Issues created |
 | VM Manager productionization | 📋 Issues created |

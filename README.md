@@ -110,14 +110,63 @@ The VM's serial console output (printed to stdout) shows the test results:
 src/
 ├── main.rs          — orchestrator: CA gen, rootfs build, proxy, TAP, nftables, VM launch
 ├── certs.rs         — CA + leaf cert generation (from ae-egress-proxy)
-├── proxy.rs         — MITM TLS proxy, CONNECT handler, key injection (from ae-egress-proxy)
+├── proxy.rs         — MITM TLS proxy, CONNECT handler, key injection, REST session API
+├── session.rs       — Session store: SQLite persistence + in-memory stats
 ├── stream.rs        — Bidirectional byte copy with flush (from ae-egress-proxy)
+├── vault.rs         — SecretStore trait + MockSecretStore for credential fetching
 └── mock_server.py   — Mock HTTPS API server (simulates LLM API)
 build-rootfs.sh      — Builds Alpine rootfs for integration test (PoC-specific)
 build-image.sh       — Reusable image builder (step #3: image building pipeline)
 images/
 ├── EXAMPLES.md          — Image build command examples
 └── agent-init-template.sh — Custom agent init script template
+```
+
+## Proxy REST API
+
+The proxy exposes a REST API for session management on the same port as the CONNECT proxy (port 9999). HTTP method inspection distinguishes: `POST`/`DELETE`/`GET` → session management; `CONNECT` → proxy traffic.
+
+### Endpoints
+
+| Method | Path | Purpose |
+|---|---|---|
+| `POST` | `/sessions` | Register a session (source_ip, allowlist, credential_refs) |
+| `GET` | `/sessions/{id}` | Get session details + request stats |
+| `DELETE` | `/sessions/{id}` | Delete session (drops in-memory credentials) |
+| `GET` | `/sessions` | List all sessions |
+| `GET` | `/health` | Health check (includes CA cert SHA-256 fingerprint) |
+
+### Examples
+
+```bash
+# Register a session
+curl -X POST http://localhost:9999/sessions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "session_id": "sess_abc12345",
+    "source_ip": "10.0.1.42",
+    "allowlist": [
+      {"domain": "api.openai.com", "mode": "mitm", "credential_ref": "vault://secret/data/agent-env/openai-key"},
+      {"domain": "dl-cdn.alpinelinux.org", "mode": "tunnel"}
+    ]
+  }'
+
+# Get session details (includes request stats)
+curl http://localhost:9999/sessions/sess_abc12345
+
+# List all sessions
+curl http://localhost:9999/sessions
+
+# Delete a session
+curl -X DELETE http://localhost:9999/sessions/sess_abc12345
+
+# Health check (includes CA fingerprint for rootfs verification)
+curl http://localhost:9999/health
+```
+
+All errors use a standard envelope:
+```json
+{"error": {"code": "ERROR_CODE", "message": "Human-readable summary", "detail": "optional technical detail"}}
 ```
 
 ## Image Builder
