@@ -18,7 +18,6 @@ set -e
 
 ARCH=$(uname -m)
 ALPINE_VERSION="v3.20"
-ROOTFS_DIR="/tmp/ae-poc-rootfs-build"
 ROOTFS_IMG="${1:-rootfs.ext4}"
 CA_PEM="${2:-proxy-ca.pem}"
 ROOTFS_SIZE="200M"
@@ -231,7 +230,8 @@ BASE="https://dl-cdn.alpinelinux.org/alpine/${ALPINE_VERSION}/main/${ARCH}"
 
 download_apk() {
     local pkg=$1
-    local url=$(curl -sL "${BASE}/" | grep -oP "href=\"${pkg}-[^\"]+\.apk\"" | head -1 | sed 's/href="//;s/"//')
+    local url
+    url=$(curl -sL "${BASE}/" | grep -oP "href=\"${pkg}-[^\"]+\.apk\"" | head -1 | sed 's/href="//;s/"//')
     if [ -n "$url" ]; then
         curl -sL "${BASE}/${url}" -o "$PKG_DIR/$url"
         sudo -S -p '' tar xzf "$PKG_DIR/$url" -C "$MOUNTPOINT/" 2>/dev/null

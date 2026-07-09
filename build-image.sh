@@ -192,8 +192,6 @@ EOF
 # Package build dirs and repo URLs
 PKG_DIR="$BUILD_DIR/apk-pkgs"
 mkdir -p "$PKG_DIR"
-BASE_MAIN="https://dl-cdn.alpinelinux.org/alpine/${ALPINE_VERSION}/main/${ARCH}"
-BASE_COMM="https://dl-cdn.alpinelinux.org/alpine/${ALPINE_VERSION}/community/${ARCH}"
 
 # Function to install packages via apk inside the chroot.
 # This properly resolves dependencies (unlike manual tar extraction).
