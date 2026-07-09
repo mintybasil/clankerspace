@@ -19,6 +19,7 @@ mod certs;
 mod proxy;
 mod session;
 mod stream;
+mod vault;
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
