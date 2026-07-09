@@ -109,17 +109,6 @@ impl Ca {
         Ok(Arc::new(config))
     }
 
-    #[allow(dead_code)]
-    pub fn upstream_client_config() -> Result<Arc<rustls::ClientConfig>, CertError> {
-        let roots = rustls::RootCertStore {
-            roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
-        };
-        let config = rustls::ClientConfig::builder()
-            .with_root_certificates(roots)
-            .with_no_client_auth();
-        Ok(Arc::new(config))
-    }
-
     pub fn upstream_client_config_no_verify() -> Result<Arc<rustls::ClientConfig>, CertError> {
         let config = rustls::ClientConfig::builder()
             .dangerous()

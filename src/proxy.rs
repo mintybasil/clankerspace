@@ -641,14 +641,24 @@ pub fn log(msg: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::certs::Ca;
+    use crate::certs::{Ca, CertError};
+
+    fn upstream_client_config() -> Result<Arc<rustls::ClientConfig>, CertError> {
+        let roots = rustls::RootCertStore {
+            roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
+        };
+        let config = rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        Ok(Arc::new(config))
+    }
 
     fn test_state() -> ProxyState {
         let ca = Arc::new(Ca::generate().unwrap());
         let server_config = ca.server_config(&["api.openai.com".to_string()]).unwrap();
         ProxyState {
             server_config,
-            upstream_config: Ca::upstream_client_config().unwrap(),
+            upstream_config: upstream_client_config().unwrap(),
             allowlist: vec!["api.openai.com".to_string()],
             api_key: "sk-REAL-KEY".into(),
             upstream_port: 0,
