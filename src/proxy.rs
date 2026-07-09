@@ -9,14 +9,18 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
-use http_body_util::Full;
-use hyper::{Request, Response, StatusCode};
+use http_body_util::{BodyExt, Full};
+use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
 use rustls::pki_types::ServerName;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio_rustls::{TlsAcceptor, TlsConnector};
 
+use crate::session::{
+    CreateSessionRequest, Session, SessionError, SessionListResponse, SessionResponse,
+    SessionStore, SessionSummary, now_secs, parse_iso8601,
+};
 use crate::stream::copy_bidirectional;
 
 #[derive(Debug, thiserror::Error)]
@@ -38,11 +42,16 @@ impl From<std::io::Error> for ProxyError {
 pub struct ProxyState {
     pub server_config: Arc<rustls::ServerConfig>,
     pub upstream_config: Arc<rustls::ClientConfig>,
+    /// Global allowlist (PoC mode — used when no session store is configured).
     pub allowlist: Vec<String>,
+    /// API key for PoC mode (global, no session store).
     pub api_key: String,
     pub upstream_port: u16,
     pub upstream_host: String,
     pub expected_vm_ip: String,
+    /// Session store for production mode (per-session allowlist, source-IP lookup).
+    /// When set, takes precedence over the global allowlist.
+    pub sessions: Option<Arc<SessionStore>>,
 }
 
 /// Handle a raw TCP connection from a client using hyper's HTTP/1.1 server.
@@ -88,17 +97,67 @@ impl ProxyService {
             None => (host_port.clone(), 443),
         };
 
-        if !is_allowlisted(&self.state, &host) {
-            log(&format!(
-                "DROP: {host} not in allowlist (peer={:?})",
-                self.peer
-            ));
-            let mut resp = Response::new(Full::new(Bytes::new()));
-            *resp.status_mut() = StatusCode::FORBIDDEN;
-            return Ok(resp);
-        }
+        // Session-based allowlist check (production mode)
+        if let Some(store) = &self.state.sessions {
+            let peer_ip = self.peer.map(|a| a.ip().to_string());
+            let session = peer_ip.and_then(|ip| store.get_by_ip(&ip));
 
-        log(&format!("ALLOW: {host}:{port} — upgrading to MITM TLS"));
+            let session = match session {
+                Some(s) => s,
+                None => {
+                    log(&format!(
+                        "DROP: {host} — no session for peer={:?}",
+                        self.peer
+                    ));
+                    let mut resp = Response::new(Full::new(Bytes::new()));
+                    *resp.status_mut() = StatusCode::FORBIDDEN;
+                    return Ok(resp);
+                }
+            };
+
+            // Check host against session's allowlist
+            let h = host.to_lowercase();
+            let allowed = session
+                .allowlist
+                .iter()
+                .any(|a| a.domain.to_lowercase() == h);
+            if !allowed {
+                log(&format!(
+                    "DROP: {host} not in session allowlist (session={})",
+                    session.session_id
+                ));
+                let mut resp = Response::new(Full::new(Bytes::new()));
+                *resp.status_mut() = StatusCode::FORBIDDEN;
+                return Ok(resp);
+            }
+
+            log(&format!(
+                "ALLOW: {host}:{port} — session={} mode={}",
+                session.session_id,
+                session
+                    .allowlist
+                    .iter()
+                    .find(|a| a.domain.to_lowercase() == h)
+                    .map(|a| a.mode.as_str())
+                    .unwrap_or("unknown")
+            ));
+
+            // For mitm mode, use the session's API key (if set); for tunnel, no injection
+            let _session = session; // keep alive for the upgrade handler
+        } else {
+            // PoC mode — global allowlist
+            if !is_allowlisted(&self.state, &host) {
+                log(&format!(
+                    "DROP: {host} not in allowlist (peer={:?})",
+                    self.peer
+                ));
+                let mut resp = Response::new(Full::new(Bytes::new()));
+                *resp.status_mut() = StatusCode::FORBIDDEN;
+                return Ok(resp);
+            }
+
+            log(&format!("ALLOW: {host}:{port} — upgrading to MITM TLS"));
+        }
 
         let mut resp = Response::new(Full::new(Bytes::new()));
         *resp.status_mut() = StatusCode::OK;
@@ -223,25 +282,240 @@ impl hyper::service::Service<Request<hyper::body::Incoming>> for ProxyService {
             let method = req.method().clone();
             let uri = req.uri().clone();
 
-            if method != hyper::Method::CONNECT {
-                let mut resp = Response::new(Full::new(Bytes::new()));
-                *resp.status_mut() = StatusCode::METHOD_NOT_ALLOWED;
-                *resp.body_mut() =
-                    Full::new(Bytes::from_static(b"ae-poc: only CONNECT is supported\n"));
-                return Ok(resp);
+            // CONNECT → proxy traffic
+            if method == hyper::Method::CONNECT {
+                let target = uri.host().unwrap_or("").to_string();
+                let port = uri.port_u16().unwrap_or(443);
+                let host_port = if target.is_empty() {
+                    uri.to_string()
+                } else {
+                    format!("{target}:{port}")
+                };
+                return svc.handle_connect(host_port, req).await;
             }
 
-            let target = uri.host().unwrap_or("").to_string();
-            let port = uri.port_u16().unwrap_or(443);
-            let host_port = if target.is_empty() {
-                uri.to_string()
-            } else {
-                format!("{target}:{port}")
-            };
-
-            svc.handle_connect(host_port, req).await
+            // Non-CONNECT methods → session management API
+            svc.handle_session_api(method, &uri, req).await
         })
     }
+}
+
+impl ProxyService {
+    /// Route non-CONNECT HTTP requests to the session management API.
+    async fn handle_session_api(
+        self,
+        method: Method,
+        uri: &hyper::Uri,
+        req: Request<hyper::body::Incoming>,
+    ) -> Result<Response<Full<Bytes>>, ProxyError> {
+        let path = uri.path();
+
+        // Only handle session routes when a session store is configured
+        let store = match &self.state.sessions {
+            Some(s) => s.clone(),
+            None => {
+                return Ok(json_response(
+                    StatusCode::NOT_FOUND,
+                    r#"{"error":{"code":"INVALID_REQUEST","message":"session API not enabled (no session store configured)"}}"#,
+                ));
+            }
+        };
+
+        // Route: POST /sessions
+        if path == "/sessions" && method == Method::POST {
+            return handle_create_session(store, req).await;
+        }
+
+        // Route: GET /sessions
+        if path == "/sessions" && method == Method::GET {
+            return Ok(handle_list_sessions(store));
+        }
+
+        // Route: GET /sessions/{id} and DELETE /sessions/{id}
+        if let Some(session_id) = path.strip_prefix("/sessions/")
+            && !session_id.is_empty()
+        {
+            if method == Method::GET {
+                return Ok(handle_get_session(store, session_id));
+            }
+            if method == Method::DELETE {
+                return handle_delete_session(store, session_id).await;
+            }
+        }
+
+        // Route: GET /health
+        if path == "/health" && method == Method::GET {
+            return Ok(handle_health(store));
+        }
+
+        // Fallback
+        Ok(json_response(
+            StatusCode::NOT_FOUND,
+            r#"{"error":{"code":"INVALID_REQUEST","message":"unknown route"}}"#,
+        ))
+    }
+}
+
+// --- Session API handlers ---
+
+async fn handle_create_session(
+    store: Arc<SessionStore>,
+    req: Request<hyper::body::Incoming>,
+) -> Result<Response<Full<Bytes>>, ProxyError> {
+    // Read body
+    let body_bytes = match req.into_body().collect().await {
+        Ok(b) => b.to_bytes(),
+        Err(e) => {
+            log(&format!("session create: failed to read body: {e}"));
+            return Ok(error_response(
+                StatusCode::BAD_REQUEST,
+                "INVALID_REQUEST",
+                "failed to read request body",
+            ));
+        }
+    };
+
+    // Parse JSON
+    let create_req: CreateSessionRequest = match serde_json::from_slice(&body_bytes) {
+        Ok(r) => r,
+        Err(e) => {
+            return Ok(error_response(
+                StatusCode::BAD_REQUEST,
+                "INVALID_REQUEST",
+                &format!("malformed JSON: {e}"),
+            ));
+        }
+    };
+
+    // Validate required fields
+    if create_req.session_id.is_empty() {
+        return Ok(error_response(
+            StatusCode::BAD_REQUEST,
+            "INVALID_REQUEST",
+            "session_id is required",
+        ));
+    }
+    if create_req.source_ip.is_empty() {
+        return Ok(error_response(
+            StatusCode::BAD_REQUEST,
+            "INVALID_REQUEST",
+            "source_ip is required",
+        ));
+    }
+    if create_req.allowlist.is_empty() {
+        return Ok(error_response(
+            StatusCode::BAD_REQUEST,
+            "INVALID_REQUEST",
+            "allowlist is required",
+        ));
+    }
+
+    let now = now_secs();
+    let expires_at = create_req.expires_at.as_deref().and_then(parse_iso8601);
+
+    let session = Session {
+        session_id: create_req.session_id.clone(),
+        source_ip: create_req.source_ip,
+        allowlist: create_req.allowlist,
+        created_at: now,
+        expires_at,
+        api_key: None, // Keys are fetched from Vault separately, not persisted
+    };
+
+    let session_id = session.session_id.clone();
+
+    match store.create(session) {
+        Ok(()) => {
+            let session = store.get(&session_id).unwrap();
+            let resp = SessionResponse::from(&session);
+            let json = serde_json::to_string(&resp).unwrap_or_else(|_| "{}".to_string());
+            Ok(json_response(StatusCode::CREATED, &json))
+        }
+        Err(SessionError::AlreadyExists(id)) => Ok(error_response(
+            StatusCode::CONFLICT,
+            "SESSION_EXISTS",
+            &format!("session already exists: {id}"),
+        )),
+        Err(e) => {
+            log(&format!("session create error: {e}"));
+            Ok(error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "INTERNAL_ERROR",
+                &e.to_string(),
+            ))
+        }
+    }
+}
+
+fn handle_get_session(store: Arc<SessionStore>, session_id: &str) -> Response<Full<Bytes>> {
+    match store.get(session_id) {
+        Some(session) => {
+            let resp = SessionResponse::from(&session);
+            let json = serde_json::to_string(&resp).unwrap_or_else(|_| "{}".to_string());
+            json_response(StatusCode::OK, &json)
+        }
+        None => error_response(
+            StatusCode::NOT_FOUND,
+            "SESSION_NOT_FOUND",
+            &format!("session not found: {session_id}"),
+        ),
+    }
+}
+
+async fn handle_delete_session(
+    store: Arc<SessionStore>,
+    session_id: &str,
+) -> Result<Response<Full<Bytes>>, ProxyError> {
+    match store.delete(session_id) {
+        Ok(true) => Ok(Response::builder()
+            .status(StatusCode::NO_CONTENT)
+            .body(Full::new(Bytes::new()))
+            .unwrap()),
+        Ok(false) => Ok(error_response(
+            StatusCode::NOT_FOUND,
+            "SESSION_NOT_FOUND",
+            &format!("session not found: {session_id}"),
+        )),
+        Err(e) => {
+            log(&format!("session delete error: {e}"));
+            Ok(error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "INTERNAL_ERROR",
+                &e.to_string(),
+            ))
+        }
+    }
+}
+
+fn handle_list_sessions(store: Arc<SessionStore>) -> Response<Full<Bytes>> {
+    let sessions: Vec<SessionSummary> = store.list().iter().map(SessionSummary::from).collect();
+    let resp = SessionListResponse { sessions };
+    let json = serde_json::to_string(&resp).unwrap_or_else(|_| "{}".to_string());
+    json_response(StatusCode::OK, &json)
+}
+
+fn handle_health(store: Arc<SessionStore>) -> Response<Full<Bytes>> {
+    let body = format!(r#"{{"status":"ok","active_sessions":{}}}"#, store.count());
+    json_response(StatusCode::OK, &body)
+}
+
+// --- JSON response helpers ---
+
+fn json_response(status: StatusCode, body: &str) -> Response<Full<Bytes>> {
+    Response::builder()
+        .status(status)
+        .header("content-type", "application/json")
+        .body(Full::new(Bytes::from(body.to_string())))
+        .unwrap()
+}
+
+fn error_response(status: StatusCode, code: &str, message: &str) -> Response<Full<Bytes>> {
+    let body = format!(
+        r#"{{"error":{{"code":"{}","message":"{}"}}}}"#,
+        code,
+        message.replace('"', "\\\"")
+    );
+    json_response(status, &body)
 }
 
 fn is_allowlisted(state: &ProxyState, host: &str) -> bool {
@@ -390,6 +664,7 @@ mod tests {
             upstream_port: 0,
             upstream_host: String::new(),
             expected_vm_ip: "10.0.0.2".to_string(),
+            sessions: None,
         }
     }
 

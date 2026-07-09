@@ -17,6 +17,7 @@
 
 mod certs;
 mod proxy;
+mod session;
 mod stream;
 
 use std::net::SocketAddr;
@@ -89,10 +90,11 @@ async fn main() -> Result<()> {
         server_config,
         upstream_config,
         allowlist,
-        api_key: "sk-INJECTED-BY-PROXY".to_string(),
+        api_key: "«redacted:sk-…»".to_string(),
         upstream_port: MOCK_PORT, // redirect all upstream connections to the mock
         upstream_host: "127.0.0.1".to_string(), // mock server runs locally
         expected_vm_ip: VM_IP.to_string(),
+        sessions: None, // PoC mode — no session store
     };
 
     let proxy_addr: SocketAddr = format!("0.0.0.0:{PROXY_PORT}").parse()?;

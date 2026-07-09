@@ -6,6 +6,7 @@
 *.ext4
 *.bin
 *.sock
+*.sqlite
 .env
 /rootfs-build/
 .idea/
