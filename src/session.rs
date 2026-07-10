@@ -929,4 +929,59 @@ mod tests {
         assert!(errors.is_empty());
         assert_eq!(store.get("sess_nocref").unwrap().api_key, None);
     }
+
+    #[test]
+    fn test_restart_key_not_in_sqlite_but_replenished_from_vault() {
+        use crate::vault::MockSecretStore;
+
+        let db_path = "/tmp/ae-poc-test-restart-vault.sqlite";
+        let _ = std::fs::remove_file(db_path);
+
+        // Phase 1: Create a session and set its API key in memory
+        {
+            let store = SessionStore::open(db_path).unwrap();
+            let session = Session {
+                session_id: "sess_restart".to_string(),
+                source_ip: "10.0.1.160".to_string(),
+                allowlist: vec![AllowlistEntry {
+                    domain: "api.openai.com".to_string(),
+                    mode: "mitm".to_string(),
+                    credential_ref: Some("vault://secret/data/openai-key".to_string()),
+                }],
+                created_at: now_secs(),
+                expires_at: Some(now_secs() + 3600),
+                api_key: Some("sk-original".to_string()),
+            };
+            store.create(session).unwrap();
+
+            // Set key in memory (simulates POST /sessions which fetches from Vault)
+            store.set_api_key("sess_restart", "sk-fetched".to_string());
+            assert_eq!(
+                store.get("sess_restart").unwrap().api_key,
+                Some("sk-fetched".to_string())
+            );
+        }
+
+        // Phase 2: Simulate restart — reopen SQLite, api_key is None
+        {
+            let store = SessionStore::open(db_path).unwrap();
+            let session = store.get("sess_restart").unwrap();
+            assert_eq!(session.api_key, None, "api_key must not be in SQLite");
+
+            // Replenish from mock Vault
+            let secret_store = MockSecretStore::new();
+            secret_store.insert("vault://secret/data/openai-key", "sk-replenished");
+            let errors = store.replenish_api_keys(&secret_store);
+            assert!(errors.is_empty(), "replenish should succeed: {:?}", errors);
+
+            let session = store.get("sess_restart").unwrap();
+            assert_eq!(
+                session.api_key,
+                Some("sk-replenished".to_string()),
+                "api_key should be replenished from Vault"
+            );
+        }
+
+        let _ = std::fs::remove_file(db_path);
+    }
 }
