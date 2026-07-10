@@ -54,7 +54,7 @@ jobs:
           VAULT_TOKEN: root
         run: |
           # Start Vault dev server in background
-          vault server -dev -dev-root-token-id=root -dev-listen=127.0.0.1:8200 &
+          vault server -dev -dev-root-token-id=root -dev-listen-address=127.0.0.1:8200 &
           VAULT_PID=$!
 
           # Wait for Vault to be ready
