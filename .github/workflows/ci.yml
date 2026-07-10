@@ -35,11 +35,44 @@ jobs:
       - name: Clippy
         run: cargo clippy --all-targets -- -D warnings
 
+      - name: Install Vault
+        run: |
+          curl -fsSL https://releases.hashicorp.com/vault/1.18.2/vault_1.18.2_linux_amd64.zip -o vault.zip
+          unzip vault.zip
+          sudo mv vault /usr/local/bin/
+          vault version
+
       - name: Build
         run: cargo build --release
 
       - name: Unit tests
         run: cargo test --release
+
+      - name: Vault integration tests
+        env:
+          VAULT_ADDR: http://127.0.0.1:8200
+          VAULT_TOKEN: root
+        run: |
+          # Start Vault dev server in background
+          vault server -dev -dev-root-token-id=root -dev-listen=127.0.0.1:8200 &
+          VAULT_PID=$!
+
+          # Wait for Vault to be ready
+          for i in $(seq 1 10); do
+            if vault status >/dev/null 2>&1; then
+              break
+            fi
+            sleep 1
+          done
+
+          # Write test secrets
+          vault kv put secret/agent-env/openai-key key=sk-test-123
+
+          # Run ignored integration tests
+          cargo test --release -- --ignored vault::tests::test_vault_real
+
+          # Cleanup
+          kill $VAULT_PID 2>/dev/null || true
 
   shellcheck:
     runs-on: ubuntu-latest
