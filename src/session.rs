@@ -385,6 +385,49 @@ impl SessionStore {
             false
         }
     }
+
+    /// Re-fetch API keys from a SecretStore for all sessions that have
+    /// `credential_ref` entries in their allowlist. Called on proxy restart
+    /// after sessions are recovered from SQLite.
+    ///
+    /// Returns a list of `(session_id, error_message)` tuples for sessions
+    /// whose keys could not be fetched. Sessions with successful fetches
+    /// have their `api_key` set in memory.
+    #[allow(dead_code)]
+    pub fn replenish_api_keys(
+        &self,
+        secret_store: &dyn crate::vault::SecretStore,
+    ) -> Vec<(String, String)> {
+        let mut errors = Vec::new();
+        let sessions = self.list();
+
+        for session in &sessions {
+            // Find the first mitm-mode entry with a credential_ref
+            let cref = session.allowlist.iter().find_map(|entry| {
+                if entry.mode == "mitm" {
+                    entry.credential_ref.as_ref()
+                } else {
+                    None
+                }
+            });
+
+            let Some(cref) = cref else {
+                // No credential_ref for this session — skip
+                continue;
+            };
+
+            match secret_store.fetch(cref) {
+                Ok(key) => {
+                    self.set_api_key(&session.session_id, key);
+                }
+                Err(e) => {
+                    errors.push((session.session_id.clone(), e.to_string()));
+                }
+            }
+        }
+
+        errors
+    }
 }
 
 #[allow(dead_code)]
@@ -756,5 +799,134 @@ mod tests {
     fn test_get_stats_nonexistent() {
         let store = SessionStore::in_memory().unwrap();
         assert!(store.get_stats("nonexistent").is_none());
+    }
+
+    #[test]
+    fn test_replenish_api_keys_after_restart() {
+        use crate::vault::MockSecretStore;
+
+        let db_path = "/tmp/ae-poc-test-replenish.sqlite";
+        let _ = std::fs::remove_file(db_path);
+
+        // Phase 1: Create a session with a credential_ref, persist to SQLite
+        {
+            let store = SessionStore::open(db_path).unwrap();
+            let session = Session {
+                session_id: "sess_replenish".to_string(),
+                source_ip: "10.0.1.150".to_string(),
+                allowlist: vec![AllowlistEntry {
+                    domain: "api.openai.com".to_string(),
+                    mode: "mitm".to_string(),
+                    credential_ref: Some("vault://secret/data/test-key".to_string()),
+                }],
+                created_at: now_secs(),
+                expires_at: Some(now_secs() + 3600),
+                api_key: Some("sk-original".to_string()),
+            };
+            store.create(session).unwrap();
+            // api_key is None after create (not persisted)
+            assert_eq!(store.get("sess_replenish").unwrap().api_key, None);
+        }
+
+        // Phase 2: Reopen (simulates restart) — api_key is None
+        {
+            let store = SessionStore::open(db_path).unwrap();
+            let session = store.get("sess_replenish").unwrap();
+            assert_eq!(session.api_key, None);
+            assert!(session.allowlist[0].credential_ref.is_some());
+
+            // Replenish keys from mock secret store
+            let secret_store = MockSecretStore::new();
+            secret_store.insert("vault://secret/data/test-key", "sk-replenished");
+            let errors = store.replenish_api_keys(&secret_store);
+            assert!(errors.is_empty(), "expected no errors, got: {:?}", errors);
+
+            // Verify api_key is now set in memory
+            let session = store.get("sess_replenish").unwrap();
+            assert_eq!(session.api_key, Some("sk-replenished".to_string()));
+        }
+
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[test]
+    fn test_replenish_api_keys_handles_fetch_failure() {
+        use crate::vault::MockSecretStore;
+
+        let store = SessionStore::in_memory().unwrap();
+        store
+            .create(Session {
+                session_id: "sess_fail".to_string(),
+                source_ip: "10.0.1.151".to_string(),
+                allowlist: vec![AllowlistEntry {
+                    domain: "api.openai.com".to_string(),
+                    mode: "mitm".to_string(),
+                    credential_ref: Some("vault://secret/data/missing".to_string()),
+                }],
+                created_at: now_secs(),
+                expires_at: None,
+                api_key: None,
+            })
+            .unwrap();
+
+        // Mock store has no key for "vault://secret/data/missing"
+        let secret_store = MockSecretStore::new();
+        let errors = store.replenish_api_keys(&secret_store);
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].0, "sess_fail");
+        // Session's api_key remains None
+        assert_eq!(store.get("sess_fail").unwrap().api_key, None);
+    }
+
+    #[test]
+    fn test_replenish_api_keys_skips_tunnel_mode() {
+        use crate::vault::MockSecretStore;
+
+        let store = SessionStore::in_memory().unwrap();
+        store
+            .create(Session {
+                session_id: "sess_tunnel".to_string(),
+                source_ip: "10.0.1.152".to_string(),
+                allowlist: vec![AllowlistEntry {
+                    domain: "api.openai.com".to_string(),
+                    mode: "tunnel".to_string(),
+                    credential_ref: None,
+                }],
+                created_at: now_secs(),
+                expires_at: None,
+                api_key: None,
+            })
+            .unwrap();
+
+        let secret_store = MockSecretStore::new();
+        let errors = store.replenish_api_keys(&secret_store);
+        assert!(errors.is_empty(), "tunnel mode should be skipped");
+        assert_eq!(store.get("sess_tunnel").unwrap().api_key, None);
+    }
+
+    #[test]
+    fn test_replenish_api_keys_skips_no_credential_ref() {
+        use crate::vault::MockSecretStore;
+
+        let store = SessionStore::in_memory().unwrap();
+        store
+            .create(Session {
+                session_id: "sess_nocref".to_string(),
+                source_ip: "10.0.1.153".to_string(),
+                allowlist: vec![AllowlistEntry {
+                    domain: "api.openai.com".to_string(),
+                    mode: "mitm".to_string(),
+                    credential_ref: None,
+                }],
+                created_at: now_secs(),
+                expires_at: None,
+                api_key: None,
+            })
+            .unwrap();
+
+        let secret_store = MockSecretStore::new();
+        let errors = store.replenish_api_keys(&secret_store);
+        assert!(errors.is_empty());
+        assert_eq!(store.get("sess_nocref").unwrap().api_key, None);
     }
 }
