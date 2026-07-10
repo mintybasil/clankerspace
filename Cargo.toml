@@ -31,7 +31,7 @@ time = { version = "0.3", features = ["parsing", "formatting"] }
 rusqlite = { version = "0.31", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-vaultrs = "0.8.0"
+vaultrs = { version = "0.8.0", default-features = false, features = ["rustls-no-provider"] }
 sha2 = "0.10"
 
 # VM manager deps (from ae-fc-poc)
