@@ -29,6 +29,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
+use clap::Parser;
 use fctools::process_spawner::DirectProcessSpawner;
 use fctools::runtime::tokio::TokioRuntime;
 use fctools::vm::configuration::{InitMethod, VmConfiguration};
@@ -58,8 +59,31 @@ const ROOTFS_PATH: &str = "rootfs.ext4";
 const CA_PATH: &str = "proxy-ca.pem";
 const BUILD_ROOTFS_SCRIPT: &str = "build-rootfs.sh";
 
+/// ae-poc — Integration PoC: Firecracker VM → nftables → MITM egress proxy → upstream API
+#[derive(Parser, Debug)]
+#[command(version, about)]
+struct Args {
+    /// Vault server address (e.g. http://127.0.0.1:8200)
+    #[arg(long, env = "VAULT_ADDR")]
+    vault_addr: Option<String>,
+
+    /// Vault token for authentication
+    #[arg(long, env = "VAULT_TOKEN")]
+    vault_token: Option<String>,
+
+    /// SQLite database path for session persistence
+    #[arg(long, env = "AE_POC_DB_PATH", default_value = "ae-poc-sessions.sqlite")]
+    db_path: String,
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Install the ring CryptoProvider as default — vaultrs pulls in rustls
+    // with multiple provider options, so we must explicitly select one.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
+    let args = Args::parse();
+
     println!("╔════════════════════════════════════════════════════════════╗");
     println!("║  ae-poc — Integration: VM → nftables → Proxy → Upstream   ║");
     println!("╚════════════════════════════════════════════════════════════╝\n");
@@ -102,16 +126,56 @@ async fn main() -> Result<()> {
             .join(":")
     };
 
+    // Wire up Vault secret store if --vault-addr and --vault-token are provided
+    let secret_store: Option<Arc<dyn crate::vault::SecretStore>> =
+        match (&args.vault_addr, &args.vault_token) {
+            (Some(addr), Some(token)) => {
+                let store = crate::vault::VaultSecretStore::new(addr, token)
+                    .context("failed to create Vault secret store")?;
+                eprintln!("[main] Vault secret store connected: {addr}");
+                Some(Arc::new(store) as Arc<dyn crate::vault::SecretStore>)
+            }
+            _ => {
+                eprintln!("[main] No Vault configured — running in PoC mode with mock key");
+                None
+            }
+        };
+
+    // Wire up session store if Vault is configured (production mode)
+    let session_store: Option<Arc<session::SessionStore>> = if let Some(ref sec) = secret_store {
+        let store =
+            session::SessionStore::open(&args.db_path).context("failed to open session store")?;
+        eprintln!("[main] Session store opened: {}", args.db_path);
+
+        // Re-fetch API keys from Vault for all recovered sessions
+        let errors = store.replenish_api_keys(sec.as_ref());
+        for (sid, err) in &errors {
+            eprintln!("[main] WARNING: failed to re-fetch key for session {sid}: {err}");
+        }
+        if errors.is_empty() {
+            eprintln!("[main] All session keys replenished from Vault");
+        } else {
+            eprintln!(
+                "[main] {} session(s) had key replenishment failures",
+                errors.len()
+            );
+        }
+
+        Some(store)
+    } else {
+        None
+    };
+
     let proxy_state = proxy::ProxyState {
         server_config,
         upstream_config,
         allowlist,
-        api_key: "«redacted:sk-…»".to_string(),
+        api_key: String::new(), // PoC mode only — sessions use per-session keys from Vault
         upstream_port: MOCK_PORT, // redirect all upstream connections to the mock
         upstream_host: "127.0.0.1".to_string(), // mock server runs locally
         expected_vm_ip: VM_IP.to_string(),
-        sessions: None, // PoC mode — no session store
-        secret_store: None,
+        sessions: session_store,
+        secret_store,
         ca_cert_sha256,
         start_time: session::now_secs(),
     };
