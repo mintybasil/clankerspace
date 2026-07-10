@@ -81,8 +81,10 @@ pub struct SessionResponse {
     pub session_id: String,
     pub source_ip: String,
     pub allowlist: Vec<AllowlistEntry>,
-    pub created_at: u64,
-    pub expires_at: Option<u64>,
+    pub created_at: String,
+    pub expires_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stats: Option<SessionStats>,
 }
 
 /// REST API response for `GET /sessions` (list).
@@ -95,8 +97,19 @@ pub struct SessionListResponse {
 pub struct SessionSummary {
     pub session_id: String,
     pub source_ip: String,
-    pub created_at: u64,
-    pub expires_at: Option<u64>,
+    pub created_at: String,
+    pub expires_at: Option<String>,
+}
+
+/// Per-session request statistics (in-memory only, not persisted).
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct SessionStats {
+    pub requests_total: u64,
+    pub requests_mitm: u64,
+    pub requests_tunnel: u64,
+    pub requests_dropped: u64,
+    pub bytes_upstream: u64,
+    pub bytes_downstream: u64,
 }
 
 impl From<&Session> for SessionResponse {
@@ -105,8 +118,9 @@ impl From<&Session> for SessionResponse {
             session_id: s.session_id.clone(),
             source_ip: s.source_ip.clone(),
             allowlist: s.allowlist.clone(),
-            created_at: s.created_at,
-            expires_at: s.expires_at,
+            created_at: format_iso8601(s.created_at).unwrap_or_default(),
+            expires_at: s.expires_at.and_then(format_iso8601),
+            stats: None,
         }
     }
 }
@@ -116,8 +130,8 @@ impl From<&Session> for SessionSummary {
         SessionSummary {
             session_id: s.session_id.clone(),
             source_ip: s.source_ip.clone(),
-            created_at: s.created_at,
-            expires_at: s.expires_at,
+            created_at: format_iso8601(s.created_at).unwrap_or_default(),
+            expires_at: s.expires_at.and_then(format_iso8601),
         }
     }
 }
@@ -148,6 +162,8 @@ pub struct SessionStore {
     conn: std::sync::Mutex<Connection>,
     /// In-memory map: source_ip → Session (for fast CONNECT lookup).
     sessions: std::sync::Mutex<HashMap<String, Session>>,
+    /// In-memory stats per session_id (not persisted to SQLite).
+    stats: std::sync::Mutex<HashMap<String, SessionStats>>,
 }
 
 impl SessionStore {
@@ -204,6 +220,7 @@ impl SessionStore {
         Ok(Arc::new(SessionStore {
             conn: std::sync::Mutex::new(conn),
             sessions: std::sync::Mutex::new(map),
+            stats: std::sync::Mutex::new(HashMap::new()),
         }))
     }
 
@@ -215,6 +232,7 @@ impl SessionStore {
         Ok(Arc::new(SessionStore {
             conn: std::sync::Mutex::new(conn),
             sessions: std::sync::Mutex::new(HashMap::new()),
+            stats: std::sync::Mutex::new(HashMap::new()),
         }))
     }
 
@@ -316,6 +334,11 @@ impl SessionStore {
             map.remove(&source_ip);
         }
 
+        // Remove stats
+        {
+            self.stats.lock().unwrap().remove(&session_id.to_string());
+        }
+
         Ok(true)
     }
 
@@ -328,6 +351,27 @@ impl SessionStore {
     /// Get the count of active sessions.
     pub fn count(&self) -> usize {
         self.sessions.lock().unwrap().len()
+    }
+
+    /// Record a request for a session (updates in-memory stats only).
+    #[allow(dead_code)]
+    pub fn record_stats(&self, session_id: &str, kind: &str, bytes_up: u64, bytes_down: u64) {
+        let mut stats = self.stats.lock().unwrap();
+        let entry = stats.entry(session_id.to_string()).or_default();
+        entry.requests_total += 1;
+        match kind {
+            "mitm" => entry.requests_mitm += 1,
+            "tunnel" => entry.requests_tunnel += 1,
+            "dropped" => entry.requests_dropped += 1,
+            _ => {}
+        }
+        entry.bytes_upstream += bytes_up;
+        entry.bytes_downstream += bytes_down;
+    }
+
+    /// Get stats for a session.
+    pub fn get_stats(&self, session_id: &str) -> Option<SessionStats> {
+        self.stats.lock().unwrap().get(session_id).cloned()
     }
 
     /// Set the API key for a session (memory only, not persisted).
@@ -368,6 +412,18 @@ pub fn parse_iso8601(s: &str) -> Option<u64> {
         Ok(dt) => Some(dt.unix_timestamp() as u64),
         Err(_) => None,
     }
+}
+
+/// Format a Unix timestamp (seconds) as an ISO 8601 / RFC 3339 string.
+/// Returns None if the timestamp is 0.
+pub fn format_iso8601(ts: u64) -> Option<String> {
+    if ts == 0 {
+        return None;
+    }
+    use time::format_description::well_known::Rfc3339;
+    time::OffsetDateTime::from_unix_timestamp(ts as i64)
+        .ok()
+        .map(|dt| dt.format(&Rfc3339).unwrap_or_default())
 }
 
 #[cfg(test)]
@@ -644,5 +700,61 @@ mod tests {
         let ts = parse_iso8601("2026-07-07T22:37:06Z");
         assert!(ts.is_some());
         assert!(ts.unwrap() > 0);
+    }
+
+    #[test]
+    fn test_format_iso8601() {
+        assert_eq!(format_iso8601(0), None);
+        let ts_str = format_iso8601(1751908626).unwrap(); // 2025-07-07T...
+        assert!(ts_str.contains("T"));
+        assert!(ts_str.contains("Z") || ts_str.contains("+"));
+    }
+
+    #[test]
+    fn test_format_and_parse_roundtrip() {
+        let original = 1751908626u64;
+        let formatted = format_iso8601(original).unwrap();
+        let parsed = parse_iso8601(&formatted).unwrap();
+        assert_eq!(original, parsed);
+    }
+
+    #[test]
+    fn test_record_and_get_stats() {
+        let store = SessionStore::in_memory().unwrap();
+        store
+            .create(make_session("sess_stats", "10.0.1.200"))
+            .unwrap();
+
+        store.record_stats("sess_stats", "mitm", 100, 200);
+        store.record_stats("sess_stats", "mitm", 50, 75);
+        store.record_stats("sess_stats", "tunnel", 30, 40);
+        store.record_stats("sess_stats", "dropped", 0, 0);
+
+        let stats = store.get_stats("sess_stats").expect("stats should exist");
+        assert_eq!(stats.requests_total, 4);
+        assert_eq!(stats.requests_mitm, 2);
+        assert_eq!(stats.requests_tunnel, 1);
+        assert_eq!(stats.requests_dropped, 1);
+        assert_eq!(stats.bytes_upstream, 180);
+        assert_eq!(stats.bytes_downstream, 315);
+    }
+
+    #[test]
+    fn test_stats_removed_on_delete() {
+        let store = SessionStore::in_memory().unwrap();
+        store
+            .create(make_session("sess_stats_del", "10.0.1.201"))
+            .unwrap();
+        store.record_stats("sess_stats_del", "mitm", 10, 20);
+        assert!(store.get_stats("sess_stats_del").is_some());
+
+        store.delete("sess_stats_del").unwrap();
+        assert!(store.get_stats("sess_stats_del").is_none());
+    }
+
+    #[test]
+    fn test_get_stats_nonexistent() {
+        let store = SessionStore::in_memory().unwrap();
+        assert!(store.get_stats("nonexistent").is_none());
     }
 }

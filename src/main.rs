@@ -1,4 +1,4 @@
-//! ae-poc — Integration PoC: Firecracker VM → nftables DNAT → MITM egress proxy → upstream API
+//! ae-poc — Integration PoC: Firecracker VM → nftables → MITM egress proxy → upstream API
 //!
 //! This binary integrates the two prior spikes (ae-egress-proxy and ae-fc-poc)
 //! into a single end-to-end path:
@@ -6,6 +6,8 @@
 //!   1. Generate a MITM CA certificate.
 //!   2. Build a rootfs with curl + the CA cert baked in (via build-rootfs.sh).
 //!   3. Start the egress proxy on 0.0.0.0:9999 (receives VM traffic via nftables DNAT).
+//!      The proxy also serves a REST API for session management on the same port:
+//!      POST /sessions, GET /sessions/{id}, DELETE /sessions/{id}, GET /sessions, GET /health.
 //!   4. Set up a TAP interface (tap0) and nftables DNAT rules.
 //!   5. Launch a Firecracker VM via fctools with the rootfs.
 //!   6. The VM's init script runs a test: curl through the proxy to a mock HTTPS server.
@@ -19,6 +21,7 @@ mod certs;
 mod proxy;
 mod session;
 mod stream;
+mod vault;
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -86,6 +89,19 @@ async fn main() -> Result<()> {
     let server_config = ca.server_config(&allowlist)?;
     let upstream_config = certs::Ca::upstream_client_config_no_verify()?;
 
+    // Compute CA cert SHA-256 fingerprint for health endpoint
+    let ca_cert_sha256 = {
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(ca.ca_der.as_ref());
+        hasher
+            .finalize()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<Vec<_>>()
+            .join(":")
+    };
+
     let proxy_state = proxy::ProxyState {
         server_config,
         upstream_config,
@@ -95,6 +111,9 @@ async fn main() -> Result<()> {
         upstream_host: "127.0.0.1".to_string(), // mock server runs locally
         expected_vm_ip: VM_IP.to_string(),
         sessions: None, // PoC mode — no session store
+        secret_store: None,
+        ca_cert_sha256,
+        start_time: session::now_secs(),
     };
 
     let proxy_addr: SocketAddr = format!("0.0.0.0:{PROXY_PORT}").parse()?;
