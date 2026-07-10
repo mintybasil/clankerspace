@@ -113,7 +113,7 @@ src/
 ├── proxy.rs         — MITM TLS proxy, CONNECT handler, key injection, REST session API
 ├── session.rs       — Session store: SQLite persistence + in-memory stats
 ├── stream.rs        — Bidirectional byte copy with flush (from ae-egress-proxy)
-├── vault.rs         — SecretStore trait + MockSecretStore for credential fetching
+├── vault.rs         — SecretStore trait + MockSecretStore + VaultSecretStore (vaultrs KV v2)
 └── mock_server.py   — Mock HTTPS API server (simulates LLM API)
 build-rootfs.sh      — Builds Alpine rootfs for integration test (PoC-specific)
 build-image.sh       — Reusable image builder (step #3: image building pipeline)
@@ -168,6 +168,28 @@ All errors use a standard envelope:
 ```json
 {"error": {"code": "ERROR_CODE", "message": "Human-readable summary", "detail": "optional technical detail"}}
 ```
+
+### Vault Integration
+
+The proxy supports HashiCorp Vault for credential storage. When `--vault-addr` and `--vault-token` are provided, the proxy operates in production mode:
+
+- **Session store** is enabled (SQLite-backed, sessions survive restarts).
+- **Credential resolution** fetches API keys from Vault at `POST /sessions` time using the `credential_ref` field (e.g., `vault://secret/data/agent-env/openai-key`).
+- **Keys are held in memory only** — never persisted to SQLite or disk.
+- **On restart**, sessions are recovered from SQLite and keys are re-fetched from Vault automatically.
+
+```bash
+# Run with Vault (production mode)
+./target/release/ae-poc --vault-addr http://127.0.0.1:8200 --vault-token root
+
+# Or via environment variables
+VAULT_ADDR=http://127.0.0.1:8200 VAULT_TOKEN=root ./target/release/ae-poc
+
+# Run without Vault (PoC mode — no session store, mock key)
+./target/release/ae-poc
+```
+
+The `credential_ref` format is `vault://<mount>/<path>` where `<mount>` is the KV v2 mount (typically `secret`) and `<path>` is the secret path. The `data/` segment is optional and stripped automatically. The secret value is extracted from the first matching field: `key`, `api_key`, `token`, or the first string value in the secret data.
 
 ## Image Builder
 
