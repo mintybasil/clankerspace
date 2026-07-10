@@ -278,6 +278,14 @@ mod tests {
         }
     }
 
+    /// Install the ring CryptoProvider — required because vaultrs uses
+    /// reqwest with `rustls-no-provider`, so no default crypto provider is
+    /// installed automatically. Safe to call multiple times (returns Err if
+    /// already installed, which we ignore).
+    fn install_crypto_provider() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    }
+
     /// Integration test: requires a Vault dev server running on localhost:8200.
     /// Run with: cargo test --release -- --ignored vault::tests::test_vault_real
     ///
@@ -287,6 +295,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     #[ignore] // Requires real Vault dev server
     async fn test_vault_real_fetch_success() {
+        install_crypto_provider();
         let store = VaultSecretStore::new("http://127.0.0.1:8200", "root")
             .expect("failed to create VaultSecretStore — is vault dev server running?");
 
@@ -300,6 +309,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     #[ignore] // Slow (timeout-based)
     async fn test_vault_real_unreachable() {
+        install_crypto_provider();
         // Point to a port nothing is listening on
         let store = VaultSecretStore::new("http://127.0.0.1:59999", "root")
             .expect("vault client creation should succeed even if server is down");
@@ -323,6 +333,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     #[ignore] // Requires real Vault dev server
     async fn test_vault_real_not_found() {
+        install_crypto_provider();
         let store = VaultSecretStore::new("http://127.0.0.1:8200", "root")
             .expect("failed to create VaultSecretStore");
 
