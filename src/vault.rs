@@ -159,22 +159,22 @@ impl VaultSecretStore {
 
     /// Async helper: read a KV v2 secret from Vault and extract the API key.
     async fn fetch_async(&self, mount: &str, path: &str) -> Result<String, SecretStoreError> {
-        let response: vaultrs::api::kv2::responses::ReadSecretResponse =
-            vaultrs::kv2::read(&self.client, mount, path)
-                .await
-                .map_err(|e| {
-                    let msg = format!("{e}");
-                    if msg.contains("not found") || msg.contains("404") {
-                        SecretStoreError::NotFound(format!("{mount}/data/{path}: {msg}"))
-                    } else {
-                        SecretStoreError::Internal(format!("vault read {mount}/data/{path}: {msg}"))
-                    }
-                })?;
+        // kv2::read deserializes res.data into D. We use serde_json::Value
+        // to get the raw JSON object, then extract the key field.
+        let data: serde_json::Value = vaultrs::kv2::read(&self.client, mount, path)
+            .await
+            .map_err(|e| {
+                let msg = format!("{e}");
+                if msg.contains("not found") || msg.contains("404") {
+                    SecretStoreError::NotFound(format!("{mount}/data/{path}: {msg}"))
+                } else {
+                    SecretStoreError::Internal(format!("vault read {mount}/data/{path}: {msg}"))
+                }
+            })?;
 
-        // The response.data is a serde_json::Value (a JSON object).
-        // Try common field names: "key", "api_key", "token".
-        // Fall back to the first string value in the object.
-        if let serde_json::Value::Object(ref map) = response.data {
+        // The secret data is a JSON object. Try common field names:
+        // "key", "api_key", "token". Fall back to the first string value.
+        if let serde_json::Value::Object(ref map) = data {
             for field in &["key", "api_key", "token"] {
                 if let Some(serde_json::Value::String(val)) = map.get(*field) {
                     return Ok(val.clone());
