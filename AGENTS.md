@@ -92,6 +92,6 @@ sudo ./target/release/ae-poc
 | Image builder | ✅ Working (minimal + Pi images) |
 | API contracts | ✅ Defined |
 | Session management REST API | ✅ Implemented (POST/GET/DELETE /sessions, GET /health) |
-|| Credential fetching (SecretStore) | ✅ Trait + mock + FileSecretStore (encrypted key file) |
+| Credential fetching (SecretStore) | ✅ Trait + mock + FileSecretStore (encrypted key file) |
 | Proxy productionization | 📋 Issues created |
 | VM Manager productionization | 📋 Issues created |
