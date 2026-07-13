@@ -4,9 +4,11 @@
 //! (e.g. `vault://secret/data/agent-env/openai-key`) at session registration
 //! time. Keys are held in memory only — never persisted to SQLite.
 //!
-//! In production, `FileSecretStore` reads a pre-decrypted JSON key file
-//! (the file is encrypted at rest by an external tool such as `age`, GPG,
-//! or LUKS — the proxy does not handle decryption). For tests,
+//! In production, `FileSecretStore` loads keys from an encrypted file on disk.
+//! The file is decrypted **in memory** via an external decryption command
+//! (e.g. `age -d -i /path/to/identity`). The plaintext never exists on disk —
+//! the encrypted file is piped through the decrypt command and the JSON output
+//! is captured directly into the proxy's process memory. For tests,
 //! `MockSecretStore` returns pre-configured keys.
 
 use std::collections::HashMap;
@@ -66,17 +68,33 @@ impl SecretStore for MockSecretStore {
 
 /// File-based secret store for production.
 ///
-/// Reads a pre-decrypted JSON file mapping `credential_ref` URIs to API keys.
-/// The file is encrypted at rest by an external tool (`age`, GPG, LUKS) —
-/// the proxy reads the already-decrypted plaintext JSON. Keys are held in
-/// memory for the proxy's lifetime.
+/// Loads keys from an encrypted file on disk, decrypting **in memory** via an
+/// external command. The plaintext JSON never exists on disk — the encrypted
+/// file is piped through the decrypt command and the output is captured
+/// directly into the proxy's process memory. Keys are held in memory for the
+/// proxy's lifetime.
 ///
-/// Format:
+/// ## Key file format (plaintext JSON, after decryption)
 /// ```json
 /// {
 ///   "vault://secret/data/agent-env/openai-key": "sk-...",
 ///   "vault://secret/data/agent-env/anthropic-key": "sk-ant-..."
 /// }
+/// ```
+///
+/// ## Usage
+///
+/// ### With a decryption command (recommended — plaintext never touches disk)
+/// ```bash
+/// # The encrypted file is piped through the decrypt command:
+/// #   ae-poc --key-file /etc/ae/keys.age --decrypt-cmd "age -d -i /etc/ae/identity"
+/// ```
+///
+/// ### Without a decryption command (plaintext file already on disk)
+/// ```bash
+/// # The file must already be decrypted externally:
+/// #   age -d -i /etc/ae/identity /etc/ae/keys.age > /tmp/keys.json
+/// #   ae-poc --key-file /tmp/keys.json
 /// ```
 #[derive(Debug)]
 #[allow(dead_code)]
@@ -99,13 +117,57 @@ impl FileSecretStore {
     /// Create a `FileSecretStore` by reading a plaintext JSON file from disk.
     ///
     /// The file should already be decrypted by an external tool before
-    /// calling this.
+    /// calling this. **Prefer `from_decrypted` instead** — it pipes the
+    /// encrypted file through a decryption command so the plaintext never
+    /// exists on disk.
     #[allow(dead_code)]
     pub fn from_file(path: &str) -> Result<Self, SecretStoreError> {
         let content = std::fs::read_to_string(path).map_err(|e| {
             SecretStoreError::Internal(format!("failed to read key file {path}: {e}"))
         })?;
         Self::new(&content)
+    }
+
+    /// Create a `FileSecretStore` by piping an encrypted file through a
+    /// decryption command. The plaintext JSON is captured from the command's
+    /// stdout directly into memory — it never exists on disk.
+    ///
+    /// The decrypt command receives the encrypted file path as its last
+    /// argument and must write the decrypted JSON to stdout. For example:
+    ///
+    /// - `age -d -i /etc/ae/identity` → runs `age -d -i /etc/ae/identity /path/to/keys.age`
+    /// - `gpg --decrypt` → runs `gpg --decrypt /path/to/keys.age`
+    ///
+    /// The encrypted file path is appended to the command automatically.
+    #[allow(dead_code)]
+    pub fn from_decrypted(path: &str, decrypt_cmd: &str) -> Result<Self, SecretStoreError> {
+        let mut cmd_parts = decrypt_cmd.split_whitespace();
+        let program = cmd_parts
+            .next()
+            .ok_or_else(|| SecretStoreError::Invalid("decrypt command is empty".into()))?;
+        let mut cmd = std::process::Command::new(program);
+        cmd.args(cmd_parts);
+        cmd.arg(path);
+        cmd.stdout(std::process::Stdio::piped());
+        cmd.stderr(std::process::Stdio::piped());
+
+        let output = cmd.output().map_err(|e| {
+            SecretStoreError::Internal(format!("failed to run decrypt command: {e}"))
+        })?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(SecretStoreError::Internal(format!(
+                "decrypt command failed (exit {}): {stderr}",
+                output.status
+            )));
+        }
+
+        let plaintext = String::from_utf8(output.stdout).map_err(|e| {
+            SecretStoreError::Invalid(format!("decrypt command output is not valid UTF-8: {e}"))
+        })?;
+
+        Self::new(&plaintext)
     }
 }
 
@@ -208,5 +270,29 @@ mod tests {
         );
 
         std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn test_file_store_from_decrypted() {
+        // Use `cat` as the "decrypt" command — it just passes the file through.
+        // This tests the full pipe mechanism without needing age/gpg installed.
+        let dir = std::env::temp_dir();
+        let path = dir.join("ae-poc-test-keys-encrypted.json");
+        std::fs::write(&path, r#"{"vault://secret/data/test-key": "sk-decrypted"}"#).unwrap();
+
+        let store = FileSecretStore::from_decrypted(path.to_str().unwrap(), "cat").unwrap();
+        assert_eq!(
+            store.fetch("vault://secret/data/test-key").unwrap(),
+            "sk-decrypted"
+        );
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn test_file_store_from_decrypted_failure() {
+        // Use a command that doesn't exist — should return an error
+        let result = FileSecretStore::from_decrypted("/nonexistent", "nonexistent-command-xyz");
+        assert!(result.is_err());
     }
 }

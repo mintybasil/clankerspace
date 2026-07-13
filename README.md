@@ -113,7 +113,7 @@ src/
 ├── proxy.rs         — MITM TLS proxy, CONNECT handler, key injection, REST session API
 ├── session.rs       — Session store: SQLite persistence + in-memory stats
 ├── stream.rs        — Bidirectional byte copy with flush (from ae-egress-proxy)
-├── vault.rs         — SecretStore trait + MockSecretStore for credential fetching
+├── vault.rs         — SecretStore trait, MockSecretStore, FileSecretStore (encrypted key file)
 └── mock_server.py   — Mock HTTPS API server (simulates LLM API)
 build-rootfs.sh      — Builds Alpine rootfs for integration test (PoC-specific)
 build-image.sh       — Reusable image builder (step #3: image building pipeline)
@@ -228,6 +228,60 @@ The default `/etc/init.d/agent-init` prints a "ready" message and starts Pi if i
 ### Build examples
 
 See [`images/EXAMPLES.md`](images/EXAMPLES.md) for 6 example build commands covering minimal, Pi, dev tools, custom proxy, and no-proxy scenarios.
+
+## Credential Storage
+
+The proxy supports loading API keys from an encrypted key file at startup. Keys
+are held in memory only — never persisted to SQLite or written to disk in
+plaintext.
+
+### Key file format
+
+The key file is a JSON map of `credential_ref` URIs to API key values:
+
+```json
+{
+  "vault://secret/data/agent-env/openai-key": "sk-...",
+  "vault://secret/data/agent-env/anthropic-key": "sk-ant-..."
+}
+```
+
+The `vault://` URI scheme is retained as an opaque identifier — it is just a
+key into the in-memory map. No Vault dependency.
+
+### Loading encrypted keys (recommended — plaintext never touches disk)
+
+Use `--key-file` with `--decrypt-cmd` to pipe the encrypted file through an
+external decryption command. The plaintext JSON goes directly from the
+command's stdout into the proxy's process memory:
+
+```bash
+# With age:
+ae-poc --key-file /etc/ae/keys.age --decrypt-cmd "age -d -i /etc/ae/identity"
+
+# With GPG:
+ae-poc --key-file /etc/ae/keys.gpg --decrypt-cmd "gpg --decrypt"
+```
+
+The encrypted file path is appended as the last argument to the decrypt command.
+
+### Loading plaintext keys (for development)
+
+Without `--decrypt-cmd`, the key file is read as plaintext JSON directly:
+
+```bash
+# Decrypt to a temp file first (for development only):
+age -d -i /etc/ae/identity /etc/ae/keys.age > /tmp/keys.json
+ae-poc --key-file /tmp/keys.json
+```
+
+### Environment variables
+
+| Flag | Env var | Description |
+|---|---|---|
+| `--key-file` | `AE_KEY_FILE` | Path to the (encrypted or plaintext) key file |
+| `--decrypt-cmd` | `AE_DECRYPT_CMD` | Command to decrypt the key file (e.g. `age -d -i /etc/ae/identity`) |
+| `--api-key` | `AE_API_KEY` | PoC mode: hardcoded API key (ignored if `--key-file` is set) |
 
 ## Related
 
