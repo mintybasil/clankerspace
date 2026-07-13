@@ -113,10 +113,8 @@ impl FileSecretStore {
     /// Create a `FileSecretStore` by reading a plaintext JSON file from disk.
     ///
     /// The file should already be decrypted by an external tool before
-    /// calling this. **Prefer `from_decrypted` instead** — it pipes the
-    /// encrypted file through a decryption command so the plaintext never
-    /// exists on disk.
-    #[allow(dead_code)]
+    /// calling this. For production use, prefer piping via stdin
+    /// (`from_stdin`) so the plaintext never exists on disk.
     pub fn from_file(path: &str) -> Result<Self, SecretStoreError> {
         let content = std::fs::read_to_string(path).map_err(|e| {
             SecretStoreError::Internal(format!("failed to read key file {path}: {e}"))
@@ -134,7 +132,6 @@ impl FileSecretStore {
     /// ```bash
     /// age -d -i /etc/ae/identity /etc/ae/keys.age | ae-poc --key-file -
     /// ```
-    #[allow(dead_code)]
     pub fn from_stdin() -> Result<Self, SecretStoreError> {
         use std::io::Read;
         let mut input = String::new();

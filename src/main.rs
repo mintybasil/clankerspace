@@ -73,8 +73,8 @@ struct Cli {
 
     /// API key for PoC mode (hardcoded, no secret store).
     /// Ignored if --key-file is provided.
-    #[arg(long, env = "AE_API_KEY", default_value = "«redacted:sk-…»")]
-    api_key: String,
+    #[arg(long, env = "AE_API_KEY")]
+    api_key: Option<String>,
 }
 
 #[tokio::main]
@@ -143,7 +143,7 @@ async fn main() -> Result<()> {
         server_config,
         upstream_config,
         allowlist,
-        api_key: cli.api_key.clone(),
+        api_key: cli.api_key.clone().unwrap_or_default(),
         upstream_port: MOCK_PORT, // redirect all upstream connections to the mock
         upstream_host: "127.0.0.1".to_string(), // mock server runs locally
         expected_vm_ip: VM_IP.to_string(),
