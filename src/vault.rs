@@ -2,14 +2,14 @@
 //!
 //! The proxy uses a `SecretStore` to resolve `credential_ref` entries
 //! (e.g., `vault://secret/data/agent-env/openai-key`) at session registration
-//! time. Keys are held in memory only — never persisted to SQLite.
+//! time. Each `credential_ref` maps to a `KeyPair` containing a dummy key
+//! (injected into the VM) and a real key (used for upstream API calls).
+//! Key pairs are held in memory only — never persisted to SQLite.
 //!
-//! In production, `FileSecretStore` loads keys from stdin (piped from an
-//! external decryption tool) or from a plaintext file on disk. The
-//! recommended approach is piping via stdin — the decrypted JSON goes
-//! directly from the decrypt tool's stdout into the proxy's process memory
-//! without ever existing on disk. For tests, `MockSecretStore` returns
-//! pre-configured keys.
+//! In production, `FileSecretStore` loads key pairs from stdin (piped from
+//! an external decryption tool like `age`). The decrypted JSON goes directly
+//! from the tool's stdout into the proxy's process memory — it never exists
+//! on disk. For tests, `MockSecretStore` returns pre-configured key pairs.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -26,18 +26,26 @@ pub enum SecretStoreError {
     Internal(String),
 }
 
-/// Abstraction over a secret store (file-based in production, mock in tests).
-pub trait SecretStore: Send + Sync {
-    /// Resolve a credential reference (e.g. `vault://secret/data/path`)
-    /// and return the secret value (the API key).
-    fn fetch(&self, credential_ref: &str) -> Result<String, SecretStoreError>;
+/// A dummy→real key pair. The dummy key is injected into the VM environment;
+/// the real key is used for upstream API calls. The proxy swaps the dummy
+/// for the real at MITM time.
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+pub struct KeyPair {
+    pub dummy: String,
+    pub real: String,
 }
 
-/// Mock secret store for tests. Keys are pre-configured in a HashMap.
+/// Abstraction over a secret store (file-based in production, mock in tests).
+pub trait SecretStore: Send + Sync {
+    /// Resolve a credential reference and return the `{dummy, real}` key pair.
+    fn fetch(&self, credential_ref: &str) -> Result<KeyPair, SecretStoreError>;
+}
+
+/// Mock secret store for tests. Key pairs are pre-configured in a HashMap.
 #[derive(Debug, Default)]
 #[allow(dead_code)]
 pub struct MockSecretStore {
-    keys: Mutex<HashMap<String, String>>,
+    keys: Mutex<HashMap<String, KeyPair>>,
 }
 
 impl MockSecretStore {
@@ -47,16 +55,19 @@ impl MockSecretStore {
     }
 
     #[allow(dead_code)]
-    pub fn insert(&self, credential_ref: &str, key: &str) {
-        self.keys
-            .lock()
-            .unwrap()
-            .insert(credential_ref.to_string(), key.to_string());
+    pub fn insert(&self, credential_ref: &str, dummy: &str, real: &str) {
+        self.keys.lock().unwrap().insert(
+            credential_ref.to_string(),
+            KeyPair {
+                dummy: dummy.to_string(),
+                real: real.to_string(),
+            },
+        );
     }
 }
 
 impl SecretStore for MockSecretStore {
-    fn fetch(&self, credential_ref: &str) -> Result<String, SecretStoreError> {
+    fn fetch(&self, credential_ref: &str) -> Result<KeyPair, SecretStoreError> {
         self.keys
             .lock()
             .unwrap()
@@ -68,41 +79,38 @@ impl SecretStore for MockSecretStore {
 
 /// File-based secret store for production.
 ///
-/// Loads keys from stdin (piped from an external decryption tool) or from a
-/// plaintext file on disk. Keys are held in memory for the proxy's lifetime.
+/// Loads key pairs from stdin (piped from an external decryption tool).
+/// Keys are held in memory for the proxy's lifetime.
 ///
-/// ## Key file format (plaintext JSON)
+/// ## Key file format (plaintext JSON, after decryption)
 /// ```json
 /// {
-///   "vault://secret/data/agent-env/openai-key": "sk-...",
-///   "vault://secret/data/agent-env/anthropic-key": "sk-ant-..."
+///   "vault://secret/data/agent-env/openai-key": {
+///     "dummy": "sk-dum-a7f3b2c1d4e8...",
+///     "real": "sk-proj-AbCdEfGhIjKlMn..."
+///   },
+///   "vault://secret/data/agent-env/anthropic-key": {
+///     "dummy": "sk-ant-dum-x9y8z7w6...",
+///     "real": "sk-ant-api03-Realkey..."
+///   }
 /// }
 /// ```
 ///
 /// ## Usage
-///
-/// ### Piping via stdin (recommended — plaintext never touches disk)
 /// ```bash
 /// # Decrypt externally, pipe to the proxy:
-/// age -d -i /etc/ae/identity /etc/ae/keys.age | ae-poc --key-file -
-/// ```
-///
-/// ### Plaintext file on disk (development)
-/// ```bash
-/// # File must already be decrypted:
-/// ae-poc --key-file /tmp/keys.json
+/// age -d -i /etc/ae/identity /etc/ae/keys.age | ae-poc
 /// ```
 #[derive(Debug)]
 #[allow(dead_code)]
 pub struct FileSecretStore {
-    keys: HashMap<String, String>,
+    keys: HashMap<String, KeyPair>,
 }
 
 impl FileSecretStore {
     /// Create a `FileSecretStore` from already-decrypted JSON content.
-    #[allow(dead_code)]
     pub fn new(plaintext_json: &str) -> Result<Self, SecretStoreError> {
-        let keys: HashMap<String, String> = serde_json::from_str(plaintext_json)
+        let keys: HashMap<String, KeyPair> = serde_json::from_str(plaintext_json)
             .map_err(|e| SecretStoreError::Invalid(format!("malformed key file JSON: {e}")))?;
         if keys.is_empty() {
             return Err(SecretStoreError::Invalid("key file is empty".into()));
@@ -110,27 +118,15 @@ impl FileSecretStore {
         Ok(Self { keys })
     }
 
-    /// Create a `FileSecretStore` by reading a plaintext JSON file from disk.
-    ///
-    /// The file should already be decrypted by an external tool before
-    /// calling this. For production use, prefer piping via stdin
-    /// (`from_stdin`) so the plaintext never exists on disk.
-    pub fn from_file(path: &str) -> Result<Self, SecretStoreError> {
-        let content = std::fs::read_to_string(path).map_err(|e| {
-            SecretStoreError::Internal(format!("failed to read key file {path}: {e}"))
-        })?;
-        Self::new(&content)
-    }
-
     /// Create a `FileSecretStore` by reading plaintext JSON from stdin.
     ///
-    /// Use with `--key-file -` to pipe decrypted keys directly from an
-    /// external decryption tool. The plaintext JSON goes from the tool's
-    /// stdout into the proxy's process memory — it never exists on disk.
+    /// The operator pipes the decrypted key file from an external decryption
+    /// tool (e.g., `age`). The plaintext JSON goes from the tool's stdout
+    /// into the proxy's process memory — it never exists on disk.
     ///
     /// Example:
     /// ```bash
-    /// age -d -i /etc/ae/identity /etc/ae/keys.age | ae-poc --key-file -
+    /// age -d -i /etc/ae/identity /etc/ae/keys.age | ae-poc
     /// ```
     pub fn from_stdin() -> Result<Self, SecretStoreError> {
         use std::io::Read;
@@ -143,7 +139,7 @@ impl FileSecretStore {
 }
 
 impl SecretStore for FileSecretStore {
-    fn fetch(&self, credential_ref: &str) -> Result<String, SecretStoreError> {
+    fn fetch(&self, credential_ref: &str) -> Result<KeyPair, SecretStoreError> {
         self.keys
             .get(credential_ref)
             .cloned()
@@ -158,11 +154,14 @@ mod tests {
     #[test]
     fn test_mock_fetch_success() {
         let store = MockSecretStore::new();
-        store.insert("vault://secret/data/test-key", "sk-test-123");
-        assert_eq!(
-            store.fetch("vault://secret/data/test-key").unwrap(),
-            "sk-test-123"
+        store.insert(
+            "vault://secret/data/test-key",
+            "sk-dummy-123",
+            "sk-real-456",
         );
+        let pair = store.fetch("vault://secret/data/test-key").unwrap();
+        assert_eq!(pair.dummy, "sk-dummy-123");
+        assert_eq!(pair.real, "sk-real-456");
     }
 
     #[test]
@@ -182,21 +181,20 @@ mod tests {
 
     #[test]
     fn test_file_store_load_and_fetch() {
-        let json = r#"{"vault://secret/data/openai-key": "sk-abc123", "vault://secret/data/anthropic-key": "sk-ant-xyz"}"#;
+        let json = r#"{"vault://secret/data/openai-key": {"dummy": "sk-dum-abc", "real": "sk-real-abc"}, "vault://secret/data/anthropic-key": {"dummy": "sk-ant-dum-xyz", "real": "sk-ant-real-xyz"}}"#;
         let store = FileSecretStore::new(json).unwrap();
-        assert_eq!(
-            store.fetch("vault://secret/data/openai-key").unwrap(),
-            "sk-abc123"
-        );
-        assert_eq!(
-            store.fetch("vault://secret/data/anthropic-key").unwrap(),
-            "sk-ant-xyz"
-        );
+        let pair = store.fetch("vault://secret/data/openai-key").unwrap();
+        assert_eq!(pair.dummy, "sk-dum-abc");
+        assert_eq!(pair.real, "sk-real-abc");
+        let pair = store.fetch("vault://secret/data/anthropic-key").unwrap();
+        assert_eq!(pair.dummy, "sk-ant-dum-xyz");
+        assert_eq!(pair.real, "sk-ant-real-xyz");
     }
 
     #[test]
     fn test_file_store_missing_key() {
-        let json = r#"{"vault://secret/data/openai-key": "sk-abc123"}"#;
+        let json =
+            r#"{"vault://secret/data/openai-key": {"dummy": "sk-dum-abc", "real": "sk-real-abc"}}"#;
         let store = FileSecretStore::new(json).unwrap();
         let result = store.fetch("vault://secret/data/nonexistent");
         assert!(result.is_err());
@@ -229,32 +227,15 @@ mod tests {
     }
 
     #[test]
-    fn test_file_store_from_file() {
-        let dir = std::env::temp_dir();
-        let path = dir.join("ae-poc-test-keys.json");
-        std::fs::write(&path, r#"{"vault://secret/data/test-key": "sk-from-file"}"#).unwrap();
-
-        let store = FileSecretStore::from_file(path.to_str().unwrap()).unwrap();
-        assert_eq!(
-            store.fetch("vault://secret/data/test-key").unwrap(),
-            "sk-from-file"
-        );
-
-        std::fs::remove_file(&path).ok();
-    }
-
-    #[test]
-    fn test_file_store_from_stdin() {
-        // Simulate piping JSON via stdin by writing to a temp file and
-        // redirecting. We can't easily pipe in a unit test, so we test
-        // that from_stdin() parses the same JSON as from_new().
-        // The actual stdin piping is tested via integration (the `|`
-        // shell operator). Here we verify the JSON parsing path is shared.
-        let json = r#"{"vault://secret/data/test-key": "sk-from-stdin"}"#;
+    fn test_file_store_from_stdin_parsing() {
+        // We can't easily pipe in a unit test, so we verify the JSON parsing
+        // path is shared with from_stdin via new(). The actual stdin piping
+        // is tested via integration (the `|` shell operator).
+        let json =
+            r#"{"vault://secret/data/test-key": {"dummy": "sk-dum-test", "real": "sk-real-test"}}"#;
         let store = FileSecretStore::new(json).unwrap();
-        assert_eq!(
-            store.fetch("vault://secret/data/test-key").unwrap(),
-            "sk-from-stdin"
-        );
+        let pair = store.fetch("vault://secret/data/test-key").unwrap();
+        assert_eq!(pair.dummy, "sk-dum-test");
+        assert_eq!(pair.real, "sk-real-test");
     }
 }

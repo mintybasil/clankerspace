@@ -231,56 +231,49 @@ See [`images/EXAMPLES.md`](images/EXAMPLES.md) for 6 example build commands cove
 
 ## Credential Storage
 
-The proxy supports loading API keys at startup. Keys are held in memory only
+The proxy loads API keys from stdin at startup. Keys are held in memory only
 — never persisted to SQLite or written to disk in plaintext.
 
 ### Key file format
 
-The key file is a JSON map of `credential_ref` URIs to API key values:
+The key file is a JSON object mapping `credential_ref` URIs to `{dummy, real}`
+key pairs:
 
 ```json
 {
-  "vault://secret/data/agent-env/openai-key": "sk-...",
-  "vault://secret/data/agent-env/anthropic-key": "sk-ant-..."
+  "vault://secret/data/agent-env/openai-key": {
+    "dummy": "sk-dum-a7f3b2c1d4e8...",
+    "real": "sk-proj-AbCdEfGhIjKlMn..."
+  },
+  "vault://secret/data/agent-env/anthropic-key": {
+    "dummy": "sk-ant-dum-x9y8z7w6...",
+    "real": "sk-ant-api03-Realkey..."
+  }
 }
 ```
 
-The `vault://` URI scheme is retained as an opaque identifier — it is just a
-key into the in-memory map. No Vault dependency.
+- **Dummy keys** are formatted to look real (same prefix, length, charset) so
+  applications inside the VM don't reject them. They are injected into the VM
+  environment.
+- **Real keys** are held in the proxy's memory only — they never enter the VM,
+  never appear in API responses, and are never persisted to disk.
+- The `credential_ref` URI scheme is an opaque identifier — no Vault dependency.
 
-### Loading via stdin (recommended — plaintext never touches disk)
+### Loading via stdin
 
-Pipe the decrypted keys directly from an external decryption tool into the
-proxy's stdin using `--key-file -`:
+Pipe the decrypted keys from an external decryption tool into the proxy's
+stdin:
 
 ```bash
 # With age:
-age -d -i /etc/ae/identity /etc/ae/keys.age | ae-poc --key-file -
+age -d -i /etc/ae/identity /etc/ae/keys.age | ae-poc
 
 # With GPG:
-gpg --decrypt /etc/ae/keys.gpg | ae-poc --key-file -
+gpg --decrypt /etc/ae/keys.gpg | ae-poc
 ```
 
 The decrypted JSON goes from the tool's stdout into the proxy's process
-memory. The plaintext never exists on disk. The decryption tool's own error
-handling and exit code propagate naturally through the pipe.
-
-### Loading from a file (development)
-
-Without stdin piping, `--key-file` reads a plaintext JSON file from disk:
-
-```bash
-# Decrypt to a temp file first (development only):
-age -d -i /etc/ae/identity /etc/ae/keys.age > /tmp/keys.json
-ae-poc --key-file /tmp/keys.json
-```
-
-### CLI flags
-
-| Flag | Env var | Description |
-|---|---|---|
-| `--key-file` | `AE_KEY_FILE` | Path to key file, or `-` to read from stdin |
-| `--api-key` | `AE_API_KEY` | PoC mode: hardcoded API key (ignored if `--key-file` is set) |
+memory. The plaintext never exists on disk. No CLI flags or env vars.
 
 ## Related
 

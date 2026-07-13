@@ -85,6 +85,10 @@ pub struct SessionResponse {
     pub expires_at: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stats: Option<SessionStats>,
+    /// Dummy keys for VM environment injection (credential_ref → dummy key).
+    /// Only present when the session has mitm-mode entries with credential_refs.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dummy_keys: Option<HashMap<String, String>>,
 }
 
 /// REST API response for `GET /sessions` (list).
@@ -121,6 +125,7 @@ impl From<&Session> for SessionResponse {
             created_at: format_iso8601(s.created_at).unwrap_or_default(),
             expires_at: s.expires_at.and_then(format_iso8601),
             stats: None,
+            dummy_keys: None,
         }
     }
 }
