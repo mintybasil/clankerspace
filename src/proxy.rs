@@ -424,8 +424,8 @@ async fn handle_create_session(
     let now = now_secs();
     let expires_at = create_req.expires_at.as_deref().and_then(parse_iso8601);
 
-    // Resolve credential_refs for mitm-mode entries
-    let mut resolved_keys: std::collections::HashMap<String, String> =
+    // Resolve credential_refs for mitm-mode entries → {dummy, real} key pairs
+    let mut resolved_pairs: std::collections::HashMap<String, crate::vault::KeyPair> =
         std::collections::HashMap::new();
     if let Some(ref sec_store) = secret_store {
         for entry in &create_req.allowlist {
@@ -433,8 +433,8 @@ async fn handle_create_session(
                 && let Some(ref cref) = entry.credential_ref
             {
                 match sec_store.fetch(cref) {
-                    Ok(key) => {
-                        resolved_keys.insert(cref.clone(), key);
+                    Ok(pair) => {
+                        resolved_pairs.insert(cref.clone(), pair);
                     }
                     Err(e) => {
                         return Ok(error_response_with_detail(
@@ -449,32 +449,44 @@ async fn handle_create_session(
         }
     }
 
+    // Build dummy_keys map for the response (credential_ref → dummy key only)
+    let dummy_keys: std::collections::HashMap<String, String> = resolved_pairs
+        .iter()
+        .map(|(cref, pair)| (cref.clone(), pair.dummy.clone()))
+        .collect();
+
     let session = Session {
         session_id: create_req.session_id.clone(),
         source_ip: create_req.source_ip.clone(),
         allowlist: create_req.allowlist.clone(),
         created_at: now,
         expires_at,
-        api_key: None, // Keys are fetched from Vault separately, not persisted
+        api_key: None, // Real keys held in memory via set_api_key, not persisted
     };
 
     let session_id = session.session_id.clone();
 
     match store.create(session) {
         Ok(()) => {
-            // Store resolved API key for the session (in memory only)
+            // Store the real key for the session (in memory only)
+            // For now, one key per session (first mitm entry).
+            // TODO: support multiple keys per session via dummy→real map.
             for entry in &create_req.allowlist {
                 if entry.mode == "mitm"
                     && let Some(ref cref) = entry.credential_ref
-                    && let Some(key) = resolved_keys.get(cref)
+                    && let Some(pair) = resolved_pairs.get(cref)
                 {
-                    store.set_api_key(&session_id, key.clone());
-                    break; // one key per session for now
+                    store.set_api_key(&session_id, pair.real.clone());
+                    break;
                 }
             }
 
             let session = store.get(&session_id).unwrap();
-            let resp = SessionResponse::from(&session);
+            let mut resp = SessionResponse::from(&session);
+            // Include dummy keys in response for VM environment injection
+            if !dummy_keys.is_empty() {
+                resp.dummy_keys = Some(dummy_keys);
+            }
             let json = serde_json::to_string(&resp).unwrap_or_else(|_| "{}".to_string());
             Ok(json_response(StatusCode::CREATED, &json))
         }
@@ -850,7 +862,11 @@ mod integration_tests {
     #[tokio::test]
     async fn test_create_and_get_session() {
         let secret_store = Arc::new(MockSecretStore::new());
-        secret_store.insert("vault://secret/data/test-key", "sk-test-key");
+        secret_store.insert(
+            "vault://secret/data/test-key",
+            "sk-dum-test",
+            "sk-real-test",
+        );
         let addr = start_test_proxy(secret_store).await;
 
         // POST /sessions

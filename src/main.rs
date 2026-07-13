@@ -101,17 +101,24 @@ async fn main() -> Result<()> {
             .collect::<Vec<_>>()
             .join(":")
     };
+    // Load secret store from stdin (piped from external decryption tool)
+    println!("      Loading key pairs from stdin...");
+    let secret_store: Arc<dyn vault::SecretStore> = {
+        let store =
+            vault::FileSecretStore::from_stdin().context("Failed to read key pairs from stdin")?;
+        Arc::new(store)
+    };
 
     let proxy_state = proxy::ProxyState {
         server_config,
         upstream_config,
         allowlist,
-        api_key: "«redacted:sk-…»".to_string(),
+        api_key: String::new(), // PoC mode not used — keys come from secret store
         upstream_port: MOCK_PORT, // redirect all upstream connections to the mock
         upstream_host: "127.0.0.1".to_string(), // mock server runs locally
         expected_vm_ip: VM_IP.to_string(),
         sessions: None, // PoC mode — no session store
-        secret_store: None,
+        secret_store: Some(secret_store),
         ca_cert_sha256,
         start_time: session::now_secs(),
     };

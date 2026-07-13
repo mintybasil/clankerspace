@@ -22,8 +22,6 @@ hyper-util = { version = "0.1", features = ["server", "http1", "http2", "tokio"]
 http-body-util = "0.1"
 http = "1"
 bytes = "1"
-pin-project-lite = "0.2"
-clap = { version = "4", features = ["derive", "env"] }
 webpki-roots = "0.26"
 thiserror = "2"
 pem = "3"
