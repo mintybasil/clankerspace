@@ -29,6 +29,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
+use clap::Parser;
 use fctools::process_spawner::DirectProcessSpawner;
 use fctools::runtime::tokio::TokioRuntime;
 use fctools::vm::configuration::{InitMethod, VmConfiguration};
@@ -58,8 +59,26 @@ const ROOTFS_PATH: &str = "rootfs.ext4";
 const CA_PATH: &str = "proxy-ca.pem";
 const BUILD_ROOTFS_SCRIPT: &str = "build-rootfs.sh";
 
+/// CLI arguments for the ae-poc integration binary.
+#[derive(Parser, Debug)]
+#[command(version, about = "Agent Environment integration PoC")]
+struct Cli {
+    /// Path to a plaintext JSON key file (pre-decrypted by external tool).
+    /// When provided, keys are loaded into a FileSecretStore for session
+    /// credential resolution. Format: {"credential_ref": "api_key"}.
+    #[arg(long, env = "AE_KEY_FILE")]
+    key_file: Option<String>,
+
+    /// API key for PoC mode (hardcoded, no secret store).
+    /// Ignored if --key-file is provided.
+    #[arg(long, env = "AE_API_KEY", default_value = "sk-poc-placeholder")]
+    api_key: String,
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
+    let cli = Cli::parse();
+
     println!("╔════════════════════════════════════════════════════════════╗");
     println!("║  ae-poc — Integration: VM → nftables → Proxy → Upstream   ║");
     println!("╚════════════════════════════════════════════════════════════╝\n");
@@ -102,16 +121,27 @@ async fn main() -> Result<()> {
             .join(":")
     };
 
+    // Load secret store from key file if provided, otherwise use PoC mode
+    let secret_store: Option<Arc<dyn vault::SecretStore>> =
+        if let Some(ref key_file_path) = cli.key_file {
+            println!("      Loading key file: {key_file_path}");
+            let store = vault::FileSecretStore::from_file(key_file_path)
+                .context("Failed to load key file")?;
+            Some(Arc::new(store))
+        } else {
+            None
+        };
+
     let proxy_state = proxy::ProxyState {
         server_config,
         upstream_config,
         allowlist,
-        api_key: "«redacted:sk-…»".to_string(),
+        api_key: cli.api_key.clone(),
         upstream_port: MOCK_PORT, // redirect all upstream connections to the mock
         upstream_host: "127.0.0.1".to_string(), // mock server runs locally
         expected_vm_ip: VM_IP.to_string(),
         sessions: None, // PoC mode — no session store
-        secret_store: None,
+        secret_store,
         ca_cert_sha256,
         start_time: session::now_secs(),
     };
