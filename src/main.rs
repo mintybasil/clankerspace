@@ -63,23 +63,13 @@ const BUILD_ROOTFS_SCRIPT: &str = "build-rootfs.sh";
 #[derive(Parser, Debug)]
 #[command(version, about = "Agent Environment integration PoC")]
 struct Cli {
-    /// Path to the key file. If `--decrypt-cmd` is also provided, the file is
-    /// encrypted and will be piped through the decrypt command. Otherwise the
-    /// file must be plaintext JSON.
+    /// Path to the key file. Use `-` to read from stdin (pipe decrypted keys
+    /// from an external tool like `age`). Otherwise, the path must point to a
+    /// plaintext JSON file on disk.
     ///
     /// Format (after decryption): {"credential_ref": "api_key"}
     #[arg(long, env = "AE_KEY_FILE")]
     key_file: Option<String>,
-
-    /// Command to decrypt the key file (e.g. `age -d -i /etc/ae/identity`).
-    /// The encrypted file path is appended as the last argument. The command
-    /// must write decrypted JSON to stdout. When provided, the plaintext
-    /// never exists on disk — it goes directly from the decrypt command's
-    /// stdout into the proxy's process memory.
-    ///
-    /// If not provided, `--key-file` is read as plaintext JSON directly.
-    #[arg(long, env = "AE_DECRYPT_CMD")]
-    decrypt_cmd: Option<String>,
 
     /// API key for PoC mode (hardcoded, no secret store).
     /// Ignored if --key-file is provided.
@@ -134,17 +124,15 @@ async fn main() -> Result<()> {
     };
 
     // Load secret store from key file if provided, otherwise use PoC mode
-    let secret_store: Option<Arc<dyn vault::SecretStore>> = if let Some(ref key_file_path) =
+    let secret_store: Option<Arc<dyn vault::SecretStore>> = if let Some(ref key_file_arg) =
         cli.key_file
     {
-        let store = if let Some(ref decrypt_cmd) = cli.decrypt_cmd {
-            println!("      Loading encrypted key file: {key_file_path}");
-            println!("      Decrypt command: {decrypt_cmd} {key_file_path}");
-            vault::FileSecretStore::from_decrypted(key_file_path, decrypt_cmd)
-                .context("Failed to decrypt key file")?
+        let store = if key_file_arg == "-" {
+            println!("      Loading keys from stdin (piped from external tool)");
+            vault::FileSecretStore::from_stdin().context("Failed to read keys from stdin")?
         } else {
-            println!("      Loading plaintext key file: {key_file_path}");
-            vault::FileSecretStore::from_file(key_file_path).context("Failed to load key file")?
+            println!("      Loading plaintext key file: {key_file_arg}");
+            vault::FileSecretStore::from_file(key_file_arg).context("Failed to load key file")?
         };
         Some(Arc::new(store))
     } else {

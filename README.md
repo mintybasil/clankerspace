@@ -231,9 +231,8 @@ See [`images/EXAMPLES.md`](images/EXAMPLES.md) for 6 example build commands cove
 
 ## Credential Storage
 
-The proxy supports loading API keys from an encrypted key file at startup. Keys
-are held in memory only — never persisted to SQLite or written to disk in
-plaintext.
+The proxy supports loading API keys at startup. Keys are held in memory only
+— never persisted to SQLite or written to disk in plaintext.
 
 ### Key file format
 
@@ -249,38 +248,38 @@ The key file is a JSON map of `credential_ref` URIs to API key values:
 The `vault://` URI scheme is retained as an opaque identifier — it is just a
 key into the in-memory map. No Vault dependency.
 
-### Loading encrypted keys (recommended — plaintext never touches disk)
+### Loading via stdin (recommended — plaintext never touches disk)
 
-Use `--key-file` with `--decrypt-cmd` to pipe the encrypted file through an
-external decryption command. The plaintext JSON goes directly from the
-command's stdout into the proxy's process memory:
+Pipe the decrypted keys directly from an external decryption tool into the
+proxy's stdin using `--key-file -`:
 
 ```bash
 # With age:
-ae-poc --key-file /etc/ae/keys.age --decrypt-cmd "age -d -i /etc/ae/identity"
+age -d -i /etc/ae/identity /etc/ae/keys.age | ae-poc --key-file -
 
 # With GPG:
-ae-poc --key-file /etc/ae/keys.gpg --decrypt-cmd "gpg --decrypt"
+gpg --decrypt /etc/ae/keys.gpg | ae-poc --key-file -
 ```
 
-The encrypted file path is appended as the last argument to the decrypt command.
+The decrypted JSON goes from the tool's stdout into the proxy's process
+memory. The plaintext never exists on disk. The decryption tool's own error
+handling and exit code propagate naturally through the pipe.
 
-### Loading plaintext keys (for development)
+### Loading from a file (development)
 
-Without `--decrypt-cmd`, the key file is read as plaintext JSON directly:
+Without stdin piping, `--key-file` reads a plaintext JSON file from disk:
 
 ```bash
-# Decrypt to a temp file first (for development only):
+# Decrypt to a temp file first (development only):
 age -d -i /etc/ae/identity /etc/ae/keys.age > /tmp/keys.json
 ae-poc --key-file /tmp/keys.json
 ```
 
-### Environment variables
+### CLI flags
 
 | Flag | Env var | Description |
 |---|---|---|
-| `--key-file` | `AE_KEY_FILE` | Path to the (encrypted or plaintext) key file |
-| `--decrypt-cmd` | `AE_DECRYPT_CMD` | Command to decrypt the key file (e.g. `age -d -i /etc/ae/identity`) |
+| `--key-file` | `AE_KEY_FILE` | Path to key file, or `-` to read from stdin |
 | `--api-key` | `AE_API_KEY` | PoC mode: hardcoded API key (ignored if `--key-file` is set) |
 
 ## Related
