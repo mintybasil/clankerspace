@@ -595,86 +595,163 @@ fn is_allowlisted(state: &ProxyState, host: &str) -> bool {
     state.allowlist.iter().any(|a| a.to_lowercase() == h)
 }
 
+/// Read a complete HTTP/1.1 request from a stream using httparse for header
+/// parsing. Returns the raw request bytes (headers + body) because
+/// `rewrite_request` operates on the raw bytes.
+///
+/// Reads headers in 4KB chunks (not byte-by-byte), then reads the body based
+/// on Content-Length or chunked transfer encoding (detected from parsed
+/// headers).
 async fn read_http_request<S>(stream: &mut S) -> Result<Vec<u8>, ProxyError>
 where
     S: AsyncReadExt + Unpin,
 {
     let mut buf = Vec::with_capacity(4096);
-    let mut tmp = [0u8; 1];
-    loop {
+    let mut tmp = [0u8; 4096];
+
+    // Read until we find the end of headers (\r\n\r\n)
+    let header_end = loop {
         let n = stream
             .read(&mut tmp)
             .await
             .map_err(|e| ProxyError::Io(e.to_string()))?;
         if n == 0 {
-            break;
-        }
-        buf.push(tmp[0]);
-        if buf.len() >= 4 && &buf[buf.len() - 4..] == b"\r\n\r\n" {
-            break;
-        }
-    }
-
-    if buf.is_empty() {
-        return Err(ProxyError::Io("empty request from client".into()));
-    }
-
-    let header_str = String::from_utf8_lossy(&buf);
-    let content_length = extract_content_length(&header_str);
-    let is_chunked = header_str
-        .to_lowercase()
-        .contains("transfer-encoding: chunked");
-
-    if is_chunked {
-        read_chunked_body(stream, &mut buf).await?;
-    } else if let Some(len) = content_length {
-        let mut body = vec![0u8; len];
-        let mut read = 0;
-        while read < len {
-            let n = stream
-                .read(&mut body[read..])
-                .await
-                .map_err(|e| ProxyError::Io(e.to_string()))?;
-            if n == 0 {
-                break;
+            if buf.is_empty() {
+                return Err(ProxyError::Io("empty request from client".into()));
             }
-            read += n;
+            return Err(ProxyError::Io(
+                "connection closed before headers complete".into(),
+            ));
         }
-        buf.extend_from_slice(&body[..read]);
+        buf.extend_from_slice(&tmp[..n]);
+
+        // Search for \r\n\r\n in the buffer
+        if let Some(pos) = find_header_end(&buf) {
+            break pos;
+        }
+    };
+
+    // Parse headers with httparse
+    let mut headers = [httparse::EMPTY_HEADER; 64];
+    let mut req = httparse::Request::new(&mut headers);
+    let parse_result = req
+        .parse(&buf)
+        .map_err(|e| ProxyError::Io(format!("httparse error: {e}")))?;
+
+    match parse_result {
+        httparse::Status::Complete(_) => {}
+        httparse::Status::Partial => {
+            return Err(ProxyError::Io("incomplete headers after read".into()));
+        }
+    }
+
+    // Extract Content-Length and Transfer-Encoding from parsed headers
+    let mut content_length: Option<usize> = None;
+    let mut is_chunked = false;
+    for h in req.headers.iter() {
+        if h.name.eq_ignore_ascii_case("content-length") {
+            let val_str = std::str::from_utf8(h.value).unwrap_or("");
+            content_length = val_str.trim().parse().ok();
+        }
+        if h.name.eq_ignore_ascii_case("transfer-encoding") {
+            let val_str = std::str::from_utf8(h.value).unwrap_or("");
+            if val_str.to_lowercase().contains("chunked") {
+                is_chunked = true;
+            }
+        }
+    }
+
+    // Read body if present
+    if is_chunked {
+        // Any bytes after header_end in buf are the start of the chunked body
+        read_chunked_body(stream, &mut buf, header_end).await?;
+    } else if let Some(len) = content_length {
+        // We may have already read some body bytes into buf
+        let body_bytes_in_buf = buf.len() - header_end;
+        if body_bytes_in_buf < len {
+            let remaining = len - body_bytes_in_buf;
+            let mut body = vec![0u8; remaining];
+            let mut read = 0;
+            while read < remaining {
+                let n = stream
+                    .read(&mut body[read..])
+                    .await
+                    .map_err(|e| ProxyError::Io(e.to_string()))?;
+                if n == 0 {
+                    break;
+                }
+                read += n;
+            }
+            buf.extend_from_slice(&body[..read]);
+        }
     }
 
     Ok(buf)
 }
 
-fn extract_content_length(headers: &str) -> Option<usize> {
-    for line in headers.lines() {
-        if let Some((name, val)) = line.split_once(':')
-            && name.trim().eq_ignore_ascii_case("content-length")
-        {
-            return val.trim().parse().ok();
+/// Find the position of the \r\n\r\n header terminator in buf.
+/// Returns the index of the first byte after \r\n\r\n (start of body).
+fn find_header_end(buf: &[u8]) -> Option<usize> {
+    if buf.len() < 4 {
+        return None;
+    }
+    for i in 0..=buf.len() - 4 {
+        if &buf[i..i + 4] == b"\r\n\r\n" {
+            return Some(i + 4);
         }
     }
     None
 }
 
-async fn read_chunked_body<S>(stream: &mut S, buf: &mut Vec<u8>) -> Result<(), ProxyError>
+/// Read a chunked transfer-encoded body using buffer-based reads.
+/// `body_start` is the offset in `buf` where body data may have already begun.
+async fn read_chunked_body<S>(
+    stream: &mut S,
+    buf: &mut Vec<u8>,
+    body_start: usize,
+) -> Result<(), ProxyError>
 where
     S: AsyncReadExt + Unpin,
 {
-    let mut tmp = [0u8; 1];
+    let mut tmp = [0u8; 4096];
+    // We need to read chunks until we see the 0-length chunk (0\r\n\r\n).
+    // The data after header_end in buf may already contain part of the body.
+    // We scan the buffer for the terminating "0\r\n\r\n" and read more if needed.
     loop {
+        // Check if we already have the terminator
+        let scan_start = body_start.min(buf.len().saturating_sub(1));
+        if let Some(pos) = find_terminator(buf, scan_start) {
+            // Truncate to just after the terminator
+            buf.truncate(pos);
+            return Ok(());
+        }
+
+        // Read more data
         let n = stream
             .read(&mut tmp)
             .await
             .map_err(|e| ProxyError::Io(e.to_string()))?;
         if n == 0 {
+            // Connection closed — return what we have
             return Ok(());
         }
-        buf.push(tmp[0]);
-        if buf.len() >= 5 && &buf[buf.len() - 5..] == b"0\r\n\r\n" {
-            return Ok(());
+        buf.extend_from_slice(&tmp[..n]);
+    }
+}
+
+/// Search for the chunked body terminator "0\r\n\r\n" starting from `start`.
+/// Returns the position just past the terminator if found.
+fn find_terminator(buf: &[u8], start: usize) -> Option<usize> {
+    if buf.len() < start + 5 {
+        return None;
+    }
+    // Look for "0\r\n\r\n" which marks the end of chunked encoding
+    for i in start..=buf.len() - 5 {
+        if &buf[i..i + 5] == b"0\r\n\r\n" {
+            return Some(i + 5);
         }
     }
+    None
 }
 
 fn rewrite_request(raw: &[u8], api_key: &str, host: &str) -> Vec<u8> {
@@ -758,6 +835,74 @@ mod tests {
         let state = test_state();
         assert!(is_allowlisted(&state, "api.openai.com"));
         assert!(!is_allowlisted(&state, "evil.com"));
+    }
+
+    // --- httparse parser tests ---
+
+    /// A simple struct that implements AsyncRead from a Vec<u8> for testing.
+    struct MockStream {
+        data: Vec<u8>,
+        pos: usize,
+    }
+
+    impl MockStream {
+        fn new(data: Vec<u8>) -> Self {
+            Self { data, pos: 0 }
+        }
+    }
+
+    impl tokio::io::AsyncRead for MockStream {
+        fn poll_read(
+            mut self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            if self.pos >= self.data.len() {
+                return std::task::Poll::Ready(Ok(()));
+            }
+            let n = std::cmp::min(buf.remaining(), self.data.len() - self.pos);
+            buf.put_slice(&self.data[self.pos..self.pos + n]);
+            self.pos += n;
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn test_read_http_request_simple() {
+        let request = b"GET /v1/models HTTP/1.1\r\nHost: api.openai.com\r\n\r\n";
+        let mut stream = MockStream::new(request.to_vec());
+        let result = read_http_request(&mut stream).await.unwrap();
+        let s = String::from_utf8_lossy(&result);
+        assert!(s.contains("GET /v1/models"));
+        assert!(s.contains("Host: api.openai.com"));
+    }
+
+    #[tokio::test]
+    async fn test_read_http_request_with_content_length() {
+        let body = r#"{"model":"gpt-4","messages":[]}"#;
+        let request = format!(
+            "POST /v1/chat/completions HTTP/1.1\r\nHost: api.openai.com\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        let mut stream = MockStream::new(request.into_bytes());
+        let result = read_http_request(&mut stream).await.unwrap();
+        let s = String::from_utf8_lossy(&result);
+        assert!(s.contains("POST /v1/chat/completions"));
+        assert!(s.contains(body));
+    }
+
+    #[tokio::test]
+    async fn test_read_http_request_chunked() {
+        // Chunked: "4\r\nWiki\r\n5\r\npedia\r\n0\r\n\r\n"
+        let request = b"POST /upload HTTP/1.1\r\nHost: example.com\r\nTransfer-Encoding: chunked\r\n\r\n4\r\nWiki\r\n5\r\npedia\r\n0\r\n\r\n";
+        let mut stream = MockStream::new(request.to_vec());
+        let result = read_http_request(&mut stream).await.unwrap();
+        let s = String::from_utf8_lossy(&result);
+        assert!(s.contains("POST /upload"));
+        assert!(s.contains("Transfer-Encoding: chunked"));
+        assert!(s.contains("Wiki"));
+        assert!(s.contains("pedia"));
     }
 }
 
