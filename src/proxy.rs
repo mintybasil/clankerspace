@@ -845,8 +845,12 @@ fn rewrite_request(raw: &[u8], api_key: &str, host: &str) -> Vec<u8> {
     joined.into_bytes()
 }
 
+// --- Logging helper (replaced by tracing macros) ---
+// The `log` function is kept for call sites that haven't been migrated yet.
+// Prefer `tracing::info!`, `tracing::warn!`, `tracing::error!` with structured fields.
+
 pub fn log(msg: &str) {
-    eprintln!("[proxy] {msg}");
+    tracing::info!("{}", msg);
 }
 
 #[cfg(test)]

@@ -60,6 +60,12 @@ const BUILD_ROOTFS_SCRIPT: &str = "build-rootfs.sh";
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Initialize structured JSON logging. Level configurable via RUST_LOG env var.
+    tracing_subscriber::fmt()
+        .json()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .init();
+
     println!("╔════════════════════════════════════════════════════════════╗");
     println!("║  ae-poc — Integration: VM → nftables → Proxy → Upstream   ║");
     println!("╚════════════════════════════════════════════════════════════╝\n");
@@ -135,12 +141,12 @@ async fn main() -> Result<()> {
                     let st = proxy_state_clone.clone();
                     tokio::spawn(async move {
                         if let Err(e) = proxy::handle_connection(stream, st).await {
-                            proxy::log(&format!("connection error: {e}"));
+                            tracing::error!("connection error: {e}");
                         }
                     });
                 }
                 Err(e) => {
-                    proxy::log(&format!("accept error: {e}"));
+                    tracing::error!("accept error: {e}");
                     break;
                 }
             }
@@ -491,7 +497,7 @@ async fn shutdown_vm(
             }
         }
         Err(e) => {
-            eprintln!("      VM shutdown error: {e:?}");
+            tracing::error!("VM shutdown error: {e:?}");
         }
     }
 

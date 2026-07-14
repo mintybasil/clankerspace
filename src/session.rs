@@ -404,7 +404,7 @@ impl SessionStore {
 
 #[allow(dead_code)]
 fn log(msg: &str) {
-    eprintln!("[session] {msg}");
+    tracing::info!("{}", msg);
 }
 
 /// Get the current Unix timestamp in seconds.
