@@ -23,9 +23,11 @@ use fctools::vmm::resource::{MovedResourceType, ResourceType};
 use tokio::sync::{mpsc, oneshot};
 use tracing::{error, info, warn};
 
+use crate::file_injection::FileInjection;
 use crate::network::{cleanup_tap_interface, remove_dnat_rule};
 use crate::proxy_client::delete_proxy_session;
 use crate::state::{EnvironmentState, VmManagerState};
+use crate::types::FileEntry;
 
 /// Run the VM lifecycle in a background task.
 /// This owns the non-Send fctools Vm handle and manages shutdown.
@@ -42,6 +44,7 @@ pub async fn run_vm_lifecycle(
     shutdown_rx: oneshot::Receiver<()>,
     vcpus: u32,
     memory_mib: u32,
+    files: Vec<FileEntry>,
 ) {
     // Launch the VM
     let vm_result = launch_vm(
@@ -53,6 +56,7 @@ pub async fn run_vm_lifecycle(
         &tap_interface,
         vcpus,
         memory_mib,
+        &files,
     )
     .await;
 
@@ -196,6 +200,7 @@ async fn launch_vm(
     tap_name: &str,
     vcpus: u32,
     memory_mib: u32,
+    files: &[FileEntry],
 ) -> Result<Vm<JailedVmmExecutor<FlatVirtualPathResolver>, DirectProcessSpawner, TokioRuntime>> {
     let installation = VmmInstallation::new(
         "/usr/local/bin/firecracker",
@@ -243,23 +248,49 @@ async fn launch_vm(
         "console=ttyS0 reboot=k panic=1 root=/dev/vda ro ip={vm_ip}::{host_tap_ip}:255.255.255.0::eth0:off",
     );
 
+    // Prepare file injection (if any files requested)
+    let file_injection = FileInjection::prepare(files, session_id).await?;
+
+    let mut drives = vec![Drive {
+        drive_id: "rootfs".to_string(),
+        is_root_device: true,
+        cache_type: None,
+        partuuid: None,
+        is_read_only: Some(true),
+        block: Some(rootfs_resource),
+        rate_limiter: None,
+        io_engine: None,
+        socket: None,
+    }];
+
+    // Add file injection drive if files were prepared
+    if let Some(ref injection) = file_injection {
+        let files_resource = resource_system
+            .create_resource(
+                &injection.disk_image,
+                ResourceType::Moved(MovedResourceType::Copied),
+            )
+            .map_err(|e| anyhow::anyhow!("Failed to create file injection resource: {e:?}"))?;
+        drives.push(Drive {
+            drive_id: "files".to_string(),
+            is_root_device: false,
+            cache_type: None,
+            partuuid: None,
+            is_read_only: Some(true),
+            block: Some(files_resource),
+            rate_limiter: None,
+            io_engine: None,
+            socket: None,
+        });
+    }
+
     let configuration_data = VmConfigurationData {
         boot_source: BootSource {
             kernel_image: kernel_resource,
             boot_args: Some(boot_args),
             initrd: None,
         },
-        drives: vec![Drive {
-            drive_id: "rootfs".to_string(),
-            is_root_device: true,
-            cache_type: None,
-            partuuid: None,
-            is_read_only: Some(true),
-            block: Some(rootfs_resource),
-            rate_limiter: None,
-            io_engine: None,
-            socket: None,
-        }],
+        drives,
         pmem_devices: Vec::new(),
         machine_configuration: MachineConfiguration {
             vcpu_count: vcpus as u8,

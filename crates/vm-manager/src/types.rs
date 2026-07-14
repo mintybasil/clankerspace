@@ -31,7 +31,7 @@ fn default_timeout_secs() -> u32 {
     3600
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[allow(dead_code)]
 pub struct FileEntry {
     pub guest_path: String,
