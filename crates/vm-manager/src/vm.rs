@@ -10,8 +10,12 @@ use fctools::vm::configuration::{InitMethod, VmConfiguration};
 use fctools::vm::models::{BootSource, Drive, MachineConfiguration, NetworkInterface};
 use fctools::vm::shutdown::{VmShutdownAction, VmShutdownMethod};
 use fctools::vm::{Vm, configuration::VmConfigurationData};
-use fctools::vmm::arguments::{VmmApiSocket, VmmArguments};
-use fctools::vmm::executor::unrestricted::UnrestrictedVmmExecutor;
+use fctools::vmm::arguments::{
+    VmmApiSocket, VmmArguments,
+    jailer::{JailerArguments, JailerCgroupVersion},
+};
+use fctools::vmm::executor::jailed::{FlatVirtualPathResolver, JailedVmmExecutor};
+use fctools::vmm::id::VmmId;
 use fctools::vmm::installation::VmmInstallation;
 use fctools::vmm::ownership::VmmOwnershipModel;
 use fctools::vmm::resource::system::ResourceSystem;
@@ -41,6 +45,7 @@ pub async fn run_vm_lifecycle(
 ) {
     // Launch the VM
     let vm_result = launch_vm(
+        &session_id,
         &kernel_path,
         &rootfs_path,
         &vm_ip,
@@ -177,8 +182,13 @@ pub async fn run_vm_lifecycle(
     info!(session_id = %session_id, "environment cleanup complete");
 }
 
-/// Launch a Firecracker VM via fctools.
+/// Launch a Firecracker VM via fctools with jailing.
+///
+/// Uses `JailedVmmExecutor` with `FlatVirtualPathResolver` to run Firecracker
+/// inside a jailer chroot with cgroup limits and non-root UID/GID.
+#[allow(clippy::too_many_arguments)]
 async fn launch_vm(
+    session_id: &str,
     kernel_path: &PathBuf,
     rootfs_path: &PathBuf,
     vm_ip: &str,
@@ -186,21 +196,34 @@ async fn launch_vm(
     tap_name: &str,
     vcpus: u32,
     memory_mib: u32,
-) -> Result<Vm<UnrestrictedVmmExecutor, DirectProcessSpawner, TokioRuntime>> {
+) -> Result<Vm<JailedVmmExecutor<FlatVirtualPathResolver>, DirectProcessSpawner, TokioRuntime>> {
     let installation = VmmInstallation::new(
         "/usr/local/bin/firecracker",
         "/usr/local/bin/jailer",
         "/usr/local/bin/snapshot-editor",
     );
 
-    let api_socket_path = PathBuf::from(format!(
-        "/tmp/ae-vm-manager-api-{}.sock",
-        std::process::id()
-    ));
+    // Unique API socket path per session (inside the jail's chroot)
+    let api_socket_path = PathBuf::from(format!("/run/ae-vm-{session_id}.sock"));
     std::fs::remove_file(&api_socket_path).ok();
 
-    let executor =
-        UnrestrictedVmmExecutor::new(VmmArguments::new(VmmApiSocket::Enabled(api_socket_path)));
+    // VmmId must be alphanumeric + dashes only, 5-60 chars.
+    // session_id uses [a-z0-9_] — replace underscores with dashes.
+    let jail_id_str = session_id.replace('_', "-");
+    let jail_id = VmmId::new(&jail_id_str).context("invalid session_id for VmmId")?;
+
+    // VMM arguments (API socket path is resolved within the jail)
+    let vmm_arguments = VmmArguments::new(VmmApiSocket::Enabled(api_socket_path));
+
+    // Jailer arguments: non-root UID/GID, cgroup v2 with CPU/memory/PID limits
+    let jailer_arguments = JailerArguments::new(jail_id)
+        .cgroup_version(JailerCgroupVersion::V2)
+        .cgroup("cpu.max", format!("{} {}", vcpus * 100000, 100000)) // vcpus × 100ms per 100ms period
+        .cgroup("memory.max", format!("{}", memory_mib as u64 * 1024 * 1024))
+        .cgroup("pids.max", "64")
+        .parent_cgroup("ae-vm-manager");
+
+    let executor = JailedVmmExecutor::new(vmm_arguments, jailer_arguments, FlatVirtualPathResolver);
 
     let resource_system = ResourceSystem::new(
         DirectProcessSpawner,
@@ -269,11 +292,11 @@ async fn launch_vm(
 
     let mut vm = Vm::prepare(executor, resource_system, installation, configuration)
         .await
-        .context("Failed to prepare VM")?;
+        .map_err(|e| anyhow::anyhow!("Failed to prepare VM: {e:?}"))?;
 
     vm.start(Duration::from_secs(10))
         .await
-        .context("Failed to start VM")?;
+        .map_err(|e| anyhow::anyhow!("Failed to start VM: {e:?}"))?;
 
     Ok(vm)
 }
