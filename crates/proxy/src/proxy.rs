@@ -66,15 +66,11 @@ pub async fn handle_connection(stream: TcpStream, state: ProxyState) -> Result<(
     if let Some(addr) = peer {
         let ip = addr.ip().to_string();
         let is_vm = ip == state.expected_vm_ip;
-        log(&format!(
-            "CONNECT from {} — {}",
-            ip,
-            if is_vm {
-                "✓ VM source IP (session identified)"
-            } else {
-                "⚠ unexpected source IP"
-            }
-        ));
+        if is_vm {
+            tracing::info!(peer = %ip, "CONNECT from VM source IP (session identified)");
+        } else {
+            tracing::warn!(peer = %ip, "CONNECT from unexpected source IP");
+        }
     }
 
     let io = TokioIo::new(stream);
@@ -127,10 +123,7 @@ impl ProxyService {
             let session = match session {
                 Some(s) => s,
                 None => {
-                    log(&format!(
-                        "DROP: {host} — no session for peer={:?}",
-                        self.peer
-                    ));
+                    tracing::warn!(host = %host, peer = ?self.peer, "DROP: no session for peer");
                     let mut resp = Response::new(Full::new(Bytes::new()));
                     *resp.status_mut() = StatusCode::FORBIDDEN;
                     return Ok(resp);
@@ -144,25 +137,13 @@ impl ProxyService {
                 .iter()
                 .any(|a| a.domain.to_lowercase() == h);
             if !allowed {
-                log(&format!(
-                    "DROP: {host} not in session allowlist (session={})",
-                    session.session_id
-                ));
+                tracing::warn!(host = %host, session_id = %session.session_id, "DROP: not in session allowlist");
                 let mut resp = Response::new(Full::new(Bytes::new()));
                 *resp.status_mut() = StatusCode::FORBIDDEN;
                 return Ok(resp);
             }
 
-            log(&format!(
-                "ALLOW: {host}:{port} — session={} mode={}",
-                session.session_id,
-                session
-                    .allowlist
-                    .iter()
-                    .find(|a| a.domain.to_lowercase() == h)
-                    .map(|a| a.mode.as_str())
-                    .unwrap_or("unknown")
-            ));
+            tracing::info!(host = %host, port = port, session_id = %session.session_id, "ALLOW: CONNECT");
 
             // Capture the session's API key for MITM injection
             session_api_key = session.api_key.clone();
@@ -170,16 +151,13 @@ impl ProxyService {
         } else {
             // PoC mode — global allowlist
             if !is_allowlisted(&self.state, &host) {
-                log(&format!(
-                    "DROP: {host} not in allowlist (peer={:?})",
-                    self.peer
-                ));
+                tracing::warn!(host = %host, peer = ?self.peer, "DROP: not in allowlist");
                 let mut resp = Response::new(Full::new(Bytes::new()));
                 *resp.status_mut() = StatusCode::FORBIDDEN;
                 return Ok(resp);
             }
 
-            log(&format!("ALLOW: {host}:{port} — upgrading to MITM TLS"));
+            tracing::info!(host = %host, port = port, "ALLOW: upgrading to MITM TLS");
         }
 
         let mut resp = Response::new(Full::new(Bytes::new()));
@@ -190,13 +168,13 @@ impl ProxyService {
             let up = match upgrade.await {
                 Ok(u) => u,
                 Err(e) => {
-                    log(&format!("upgrade failed for {host}: {e}"));
+                    tracing::error!(host = %host, error = %e, "MITM TLS upgrade failed");
                     return;
                 }
             };
 
             let upgraded = TokioIo::new(up);
-            log(&format!("MITM: got upgraded connection for {host}"));
+            tracing::info!(host = %host, "MITM: got upgraded connection");
 
             let acceptor = TlsAcceptor::from(self.state.server_config.clone());
             let mut tls_client = match tokio::time::timeout(
@@ -206,15 +184,15 @@ impl ProxyService {
             .await
             {
                 Ok(Ok(t)) => {
-                    log(&format!("MITM: TLS handshake with client OK for {host}"));
+                    tracing::info!(host = %host, "MITM: TLS handshake with client OK");
                     t
                 }
                 Ok(Err(e)) => {
-                    log(&format!("TLS accept from client failed for {host}: {e}"));
+                    tracing::error!(host = %host, error = %e, "TLS accept from client failed");
                     return;
                 }
                 Err(_) => {
-                    log(&format!("TLS accept from client TIMEOUT for {host}"));
+                    tracing::warn!(host = %host, "TLS accept from client TIMEOUT");
                     return;
                 }
             };
@@ -230,14 +208,12 @@ impl ProxyService {
                 self.state.upstream_host.clone()
             };
             let upstream_addr = format!("{real_host}:{real_port}");
-            log(&format!("MITM: connecting upstream to {upstream_addr}"));
+            tracing::info!(upstream = %upstream_addr, "MITM: connecting upstream");
 
             let tcp_up = match tokio::net::TcpStream::connect(&upstream_addr).await {
                 Ok(s) => s,
                 Err(e) => {
-                    log(&format!(
-                        "upstream TCP connect to {upstream_addr} failed: {e}"
-                    ));
+                    tracing::error!(upstream = %upstream_addr, error = %e, "upstream TCP connect failed");
                     return;
                 }
             };
@@ -245,18 +221,18 @@ impl ProxyService {
             let server_name = match ServerName::try_from(host.clone()) {
                 Ok(n) => n,
                 Err(e) => {
-                    log(&format!("invalid SNI {host}: {e}"));
+                    tracing::error!(host = %host, error = %e, "invalid SNI");
                     return;
                 }
             };
             let connector = TlsConnector::from(self.state.upstream_config.clone());
             let mut tls_upstream = match connector.connect(server_name, tcp_up).await {
                 Ok(t) => {
-                    log(&format!("MITM: upstream TLS connected to {host}"));
+                    tracing::info!(host = %host, "MITM: upstream TLS connected");
                     t
                 }
                 Err(e) => {
-                    log(&format!("upstream TLS to {host} failed: {e}"));
+                    tracing::error!(host = %host, error = %e, "upstream TLS failed");
                     return;
                 }
             };
@@ -264,7 +240,7 @@ impl ProxyService {
             let req_bytes = match read_http_request(&mut tls_client).await {
                 Ok(b) => b,
                 Err(e) => {
-                    log(&format!("read inner request from client: {e}"));
+                    tracing::error!(error = %e, "read inner request from client failed");
                     return;
                 }
             };
@@ -277,32 +253,27 @@ impl ProxyService {
                 // The bidirectional copy handles WebSocket frames (just bytes).
                 // Don't strip Authorization or inject keys — WebSocket
                 // upgrade must be transparent.
-                log(&format!(
-                    "MITM: WebSocket upgrade for {host} — passing through"
-                ));
+                tracing::info!(host = %host, "MITM: WebSocket upgrade — passing through");
                 req_bytes
             } else {
                 // Normal HTTP: rewrite Authorization header
                 let effective_key = session_api_key.as_deref().unwrap_or(&self.state.api_key);
                 let rewritten = rewrite_request(&req_bytes, effective_key, &host);
-                log(&format!(
-                    "MITM: forwarding {host} request ({} bytes)",
-                    rewritten.len()
-                ));
+                tracing::info!(host = %host, bytes = rewritten.len(), "MITM: forwarding request");
                 rewritten
             };
 
             if let Err(e) = tls_upstream.write_all(&forwarded).await {
-                log(&format!("write to upstream {host}: {e}"));
+                tracing::error!(host = %host, error = %e, "write to upstream failed");
                 return;
             }
             if let Err(e) = tls_upstream.flush().await {
-                log(&format!("flush upstream {host}: {e}"));
+                tracing::error!(host = %host, error = %e, "flush upstream failed");
                 return;
             }
 
             let _ = copy_bidirectional(&mut tls_client, &mut tls_upstream).await;
-            log(&format!("DONE: {host} connection closed"));
+            tracing::info!(host = %host, "connection closed");
         });
 
         Ok(resp)
@@ -436,7 +407,7 @@ async fn handle_create_session(
     let body_bytes = match req.into_body().collect().await {
         Ok(b) => b.to_bytes(),
         Err(e) => {
-            log(&format!("session create: failed to read body: {e}"));
+            tracing::error!(error = %e, "session create: failed to read body");
             return Ok(error_response(
                 StatusCode::BAD_REQUEST,
                 "INVALID_REQUEST",
@@ -555,7 +526,7 @@ async fn handle_create_session(
             &format!("session already exists: {id}"),
         )),
         Err(e) => {
-            log(&format!("session create error: {e}"));
+            tracing::error!(error = %e, "session create error");
             Ok(error_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "INTERNAL_ERROR",
@@ -601,7 +572,7 @@ async fn handle_delete_session(
             &format!("session not found: {session_id}"),
         )),
         Err(e) => {
-            log(&format!("session delete error: {e}"));
+            tracing::error!(error = %e, "session delete error");
             Ok(error_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "INTERNAL_ERROR",
@@ -875,14 +846,6 @@ fn rewrite_request(raw: &[u8], api_key: &str, host: &str) -> Vec<u8> {
 
     let joined = lines.join("\r\n");
     joined.into_bytes()
-}
-
-// --- Logging helper (replaced by tracing macros) ---
-// The `log` function is kept for call sites that haven't been migrated yet.
-// Prefer `tracing::info!`, `tracing::warn!`, `tracing::error!` with structured fields.
-
-pub fn log(msg: &str) {
-    tracing::info!("{}", msg);
 }
 
 #[cfg(test)]
