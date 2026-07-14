@@ -22,6 +22,9 @@ mod constants {
 use std::net::SocketAddr;
 
 use api::run_server;
+use network::{
+    install_input_filter, install_nftables_base, remove_input_filter, remove_nftables_base,
+};
 use state::VmManagerState;
 
 #[tokio::main]
@@ -37,6 +40,16 @@ async fn main() -> anyhow::Result<()> {
 
     tracing::info!(addr = %addr, "starting VM Manager");
 
+    // Install nftables base table (DNAT + forward chains)
+    if let Err(e) = install_nftables_base().await {
+        tracing::warn!(error = %e, "failed to install nftables base table (may already exist)");
+    }
+
+    // Install INPUT filter table (restricts port 9999 to TAP interfaces)
+    if let Err(e) = install_input_filter().await {
+        tracing::warn!(error = %e, "failed to install nftables INPUT filter");
+    }
+
     // Run until Ctrl+C
     let server = run_server(addr, state);
 
@@ -51,6 +64,10 @@ async fn main() -> anyhow::Result<()> {
             tracing::info!("Ctrl+C received, shutting down VM Manager");
         }
     }
+
+    // Cleanup nftables tables
+    let _ = remove_input_filter().await;
+    let _ = remove_nftables_base().await;
 
     Ok(())
 }

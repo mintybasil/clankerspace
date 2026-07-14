@@ -18,7 +18,7 @@ use crate::helpers::{
     extract_session_id, extract_session_id_and_suffix, format_iso8601, is_valid_session_id,
     now_secs,
 };
-use crate::network::{cleanup_tap_interface, setup_nftables, setup_tap_interface};
+use crate::network::{add_dnat_rule, cleanup_tap_interface, setup_tap_interface};
 use crate::proxy_client::{
     ProxyAllowlistEntry, delete_proxy_session, parse_dummy_keys, register_proxy_session,
 };
@@ -323,16 +323,16 @@ impl VmManagerState {
             );
         }
 
-        // Set up nftables DNAT rules for this TAP
-        if let Err(e) = setup_nftables(&tap_interface, &host_tap_ip, &create_req.session_id).await {
-            error!(session_id = %create_req.session_id, error = %e, "nftables setup failed");
+        // Set up nftables DNAT rules for this TAP (shared table)
+        if let Err(e) = add_dnat_rule(&tap_interface, &host_tap_ip).await {
+            error!(session_id = %create_req.session_id, error = %e, "nftables DNAT rule setup failed");
             self.release_ip(&vm_ip).await;
             let _ = cleanup_tap_interface(&tap_interface).await;
             let _ = delete_proxy_session(&self.proxy_socket, &create_req.session_id).await;
             return json_error_with_detail(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 ErrorCode::VmLaunchFailed,
-                "failed to set up nftables rules",
+                "failed to set up nftables DNAT rule",
                 format!("{e}"),
             );
         }
