@@ -1,0 +1,27 @@
+[package]
+name = "ae-poc"
+version = "0.1.0"
+edition = "2024"
+description = "Integration PoC: Firecracker VM → nftables DNAT → MITM egress proxy → upstream API"
+license = "MIT"
+repository = "https://github.com/mintybasil/ae-poc"
+
+[[bin]]
+name = "ae-poc"
+path = "src/main.rs"
+
+[dependencies]
+ae-proxy = { path = "../proxy" }
+tokio = { version = "1", features = ["full"] }
+anyhow = "1"
+fctools = { version = "0.7.0-alpha.2", features = [
+    "tokio-runtime",
+    "vm",
+    "direct-process-spawner",
+    "unrestricted-vmm-executor",
+    "nix-syscall-backend",
+] }
+futures-util = "0.3"
+sha2 = "0.10"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }

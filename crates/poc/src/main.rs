@@ -17,11 +17,7 @@
 //! The mock HTTPS server runs on the host (replacing a real LLM API) so the
 //! test is fully self-contained — no external API keys needed.
 
-mod certs;
-mod proxy;
-mod session;
-mod stream;
-mod vault;
+use ae_proxy::{certs, proxy, session, vault};
 
 use std::net::SocketAddr;
 use std::path::PathBuf;

@@ -1,0 +1,34 @@
+[package]
+name = "vm-manager"
+version = "0.1.0"
+edition = "2024"
+description = "VM Manager service for agent environments"
+license = "MIT"
+repository = "https://github.com/mintybasil/ae-poc"
+
+[[bin]]
+name = "vm-manager"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+hyper = { version = "1", features = ["server", "http1", "http2"] }
+hyper-util = { version = "0.1", features = ["server", "http1", "http2", "tokio"] }
+http-body-util = "0.1"
+http = "1"
+bytes = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
+anyhow = "1"
+futures-util = "0.3"
+libc = "0.2"
+fctools = { version = "0.7.0-alpha.2", features = [
+    "tokio-runtime",
+    "vm",
+    "direct-process-spawner",
+    "unrestricted-vmm-executor",
+    "nix-syscall-backend",
+] }
+time = { version = "0.3", features = ["parsing", "formatting"] }

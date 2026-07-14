@@ -1,54 +1,6 @@
-[package]
-name = "ae-poc"
-version = "0.1.0"
-edition = "2024"
-description = "Integration PoC: Firecracker VM → nftables DNAT → MITM egress proxy → upstream API"
-license = "MIT"
-repository = "https://github.com/mintybasil/ae-poc"
-
-[[bin]]
-name = "ae-poc"
-path = "src/main.rs"
-
-[[bin]]
-name = "vm-manager"
-path = "src/vm_manager_main.rs"
-
-[dependencies]
-# Egress proxy deps (from ae-egress-proxy)
-tokio = { version = "1", features = ["full"] }
-tokio-rustls = { version = "0.26", default-features = false, features = ["logging", "tls12", "ring"] }
-rustls = { version = "0.23", default-features = false, features = ["logging", "tls12", "ring", "std"] }
-rustls-pemfile = "2"
-rcgen = { version = "0.14", default-features = false, features = ["pem", "ring"] }
-hyper = { version = "1", features = ["server", "http1", "http2"] }
-hyper-util = { version = "0.1", features = ["server", "http1", "http2", "tokio"] }
-http-body-util = "0.1"
-http = "1"
-bytes = "1"
-webpki-roots = "0.26"
-thiserror = "2"
-pem = "3"
-time = { version = "0.3", features = ["parsing", "formatting"] }
-rusqlite = { version = "0.31", features = ["bundled"] }
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-sha2 = "0.10"
-httparse = "1"
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
-
-# VM manager deps (from ae-fc-poc)
-fctools = { version = "0.7.0-alpha.2", features = [
-    "tokio-runtime",
-    "vm",
-    "direct-process-spawner",
-    "unrestricted-vmm-executor",
-    "nix-syscall-backend",
-] }
-anyhow = "1"
-futures-util = "0.3"
-libc = "0.2"
+[workspace]
+members = ["crates/proxy", "crates/vm-manager", "crates/poc"]
+resolver = "2"
 
 [profile.release]
 opt-level = 2
