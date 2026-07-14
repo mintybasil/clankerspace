@@ -575,7 +575,7 @@ impl VmManagerState {
             vm_ip_parts[3] - 1
         );
 
-        let now = crate::session::now_secs();
+        let now = now_secs();
         let expires_at = create_req
             .timeout_secs
             .checked_add(0)
@@ -597,7 +597,7 @@ impl VmManagerState {
             })
             .collect();
 
-        let expires_iso = expires_at.and_then(crate::session::format_iso8601);
+        let expires_iso = expires_at.and_then(format_iso8601);
 
         // Register proxy session via unix socket
         let proxy_result = register_proxy_session(
@@ -766,7 +766,7 @@ impl VmManagerState {
             },
             dummy_keys,
             serial_output_url: format!("/v1/environments/{}/serial", create_req.session_id),
-            started_at: crate::session::format_iso8601(now).unwrap_or_default(),
+            started_at: format_iso8601(now).unwrap_or_default(),
             expires_at: expires_iso,
         };
 
@@ -786,15 +786,15 @@ impl VmManagerState {
             }
         };
 
-        let now = crate::session::now_secs();
+        let now = now_secs();
         let resp = EnvironmentStatusResponse {
             session_id: env.session_id.clone(),
             status: env.status.as_str().to_string(),
             vm_ip: env.vm_ip.clone(),
             tap_interface: env.tap_interface.clone(),
             proxy_session_id: env.session_id.clone(),
-            started_at: crate::session::format_iso8601(env.started_at).unwrap_or_default(),
-            expires_at: env.expires_at.and_then(crate::session::format_iso8601),
+            started_at: format_iso8601(env.started_at).unwrap_or_default(),
+            expires_at: env.expires_at.and_then(format_iso8601),
             uptime_secs: now.saturating_sub(env.started_at),
         };
         drop(envs);
@@ -837,14 +837,14 @@ impl VmManagerState {
 
     async fn handle_list_environments(&self) -> Response<Full<Bytes>> {
         let envs = self.environments.lock().await;
-        let now = crate::session::now_secs();
+        let now = now_secs();
         let summaries: Vec<EnvironmentSummary> = envs
             .values()
             .map(|env| EnvironmentSummary {
                 session_id: env.session_id.clone(),
                 status: env.status.as_str().to_string(),
                 vm_ip: env.vm_ip.clone(),
-                started_at: crate::session::format_iso8601(env.started_at).unwrap_or_default(),
+                started_at: format_iso8601(env.started_at).unwrap_or_default(),
                 uptime_secs: now.saturating_sub(env.started_at),
             })
             .collect();
@@ -1448,6 +1448,28 @@ async fn run_cmd(program: &str, args: &[&str]) -> Result<()> {
     Ok(())
 }
 
+// --- Timestamp helpers ---
+
+/// Get the current Unix timestamp in seconds.
+fn now_secs() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+}
+
+/// Format a Unix timestamp (seconds) as an ISO 8601 / RFC 3339 string.
+fn format_iso8601(ts: u64) -> Option<String> {
+    if ts == 0 {
+        return None;
+    }
+    use time::format_description::well_known::Rfc3339;
+    time::OffsetDateTime::from_unix_timestamp(ts as i64)
+        .ok()
+        .map(|dt| dt.format(&Rfc3339).unwrap_or_default())
+}
+
 // --- Tests ---
 
 #[cfg(test)]
@@ -1549,7 +1571,7 @@ mod tests {
     #[tokio::test]
     async fn test_environment_state_management() {
         let state = VmManagerState::with_proxy_socket("/tmp/test.sock");
-        let now = crate::session::now_secs();
+        let now = now_secs();
 
         // Insert environment
         {

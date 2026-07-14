@@ -12,7 +12,7 @@ path = "src/main.rs"
 
 [[bin]]
 name = "vm-manager"
-path = "src/bin/vm_manager.rs"
+path = "src/vm_manager_main.rs"
 
 [dependencies]
 # Egress proxy deps (from ae-egress-proxy)

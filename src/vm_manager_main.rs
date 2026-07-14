@@ -2,9 +2,11 @@
 //!
 //! Initializes tracing and starts the VM Manager HTTP server on 127.0.0.1:8080.
 
+mod vm_manager;
+
 use std::net::SocketAddr;
 
-use ae_poc::vm_manager::{VmManagerState, run_server};
+use vm_manager::{VmManagerState, run_server};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
