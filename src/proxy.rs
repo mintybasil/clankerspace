@@ -354,7 +354,6 @@ impl hyper::service::Service<Request<hyper::body::Incoming>> for SessionApiServi
 
 impl SessionApiService {
     /// Route HTTP requests to the session management API.
-    #[allow(dead_code)]
     async fn handle_session_api(
         self,
         method: Method,
@@ -411,7 +410,6 @@ impl SessionApiService {
 
 // --- Session API handlers ---
 
-#[allow(dead_code)]
 async fn handle_create_session(
     store: Arc<SessionStore>,
     secret_store: Option<Arc<dyn crate::vault::SecretStore>>,
@@ -550,7 +548,6 @@ async fn handle_create_session(
     }
 }
 
-#[allow(dead_code)]
 fn handle_get_session(store: Arc<SessionStore>, session_id: &str) -> Response<Full<Bytes>> {
     match store.get(session_id) {
         Some(session) => {
@@ -570,7 +567,6 @@ fn handle_get_session(store: Arc<SessionStore>, session_id: &str) -> Response<Fu
     }
 }
 
-#[allow(dead_code)]
 async fn handle_delete_session(
     store: Arc<SessionStore>,
     session_id: &str,
@@ -596,7 +592,6 @@ async fn handle_delete_session(
     }
 }
 
-#[allow(dead_code)]
 fn handle_list_sessions(store: Arc<SessionStore>) -> Response<Full<Bytes>> {
     let sessions: Vec<SessionSummary> = store.list().iter().map(SessionSummary::from).collect();
     let resp = SessionListResponse { sessions };
@@ -604,7 +599,6 @@ fn handle_list_sessions(store: Arc<SessionStore>) -> Response<Full<Bytes>> {
     json_response(StatusCode::OK, &json)
 }
 
-#[allow(dead_code)]
 fn handle_health(store: Arc<SessionStore>, state: &ProxyState) -> Response<Full<Bytes>> {
     let uptime = crate::session::now_secs().saturating_sub(state.start_time);
     let body = format!(
@@ -626,7 +620,6 @@ fn json_response(status: StatusCode, body: &str) -> Response<Full<Bytes>> {
         .unwrap()
 }
 
-#[allow(dead_code)]
 fn error_response(status: StatusCode, code: &str, message: &str) -> Response<Full<Bytes>> {
     let body = format!(
         r#"{{"error":{{"code":"{}","message":"{}"}}}}"#,
@@ -636,7 +629,6 @@ fn error_response(status: StatusCode, code: &str, message: &str) -> Response<Ful
     json_response(status, &body)
 }
 
-#[allow(dead_code)]
 fn error_response_with_detail(
     status: StatusCode,
     code: &str,
