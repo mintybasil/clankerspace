@@ -14,7 +14,7 @@ use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
 use rustls::pki_types::ServerName;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
+use tokio::net::{TcpStream, UnixStream};
 use tokio_rustls::{TlsAcceptor, TlsConnector};
 
 use crate::session::{
@@ -79,6 +79,21 @@ pub async fn handle_connection(stream: TcpStream, state: ProxyState) -> Result<(
 
     let io = TokioIo::new(stream);
     let svc = ProxyService { state, peer };
+    let conn = hyper::server::conn::http1::Builder::new()
+        .serve_connection(io, svc)
+        .with_upgrades();
+
+    conn.await.map_err(|e| ProxyError::Http(e.to_string()))
+}
+
+/// Handle a unix socket connection for the REST API (session management).
+#[allow(dead_code)]
+pub async fn handle_session_connection(
+    stream: UnixStream,
+    state: ProxyState,
+) -> Result<(), ProxyError> {
+    let io = TokioIo::new(stream);
+    let svc = SessionApiService { state };
     let conn = hyper::server::conn::http1::Builder::new()
         .serve_connection(io, svc)
         .with_upgrades();
@@ -292,7 +307,7 @@ impl hyper::service::Service<Request<hyper::body::Incoming>> for ProxyService {
             let method = req.method().clone();
             let uri = req.uri().clone();
 
-            // CONNECT → proxy traffic
+            // TCP port: CONNECT only. Non-CONNECT requests are rejected.
             if method == hyper::Method::CONNECT {
                 let target = uri.host().unwrap_or("").to_string();
                 let port = uri.port_u16().unwrap_or(443);
@@ -304,14 +319,42 @@ impl hyper::service::Service<Request<hyper::body::Incoming>> for ProxyService {
                 return svc.handle_connect(host_port, req).await;
             }
 
-            // Non-CONNECT methods → session management API
+            // Non-CONNECT on TCP port — reject (REST API is on unix socket)
+            Ok(json_response(
+                StatusCode::FORBIDDEN,
+                r#"{"error":{"code":"INVALID_REQUEST","message":"TCP port accepts CONNECT only. REST API is on the unix socket."}}"#,
+            ))
+        })
+    }
+}
+
+/// Service for the unix socket — handles REST API (session management) only.
+#[derive(Clone)]
+#[allow(dead_code)]
+struct SessionApiService {
+    state: ProxyState,
+}
+
+impl hyper::service::Service<Request<hyper::body::Incoming>> for SessionApiService {
+    type Response = Response<Full<Bytes>>;
+    type Error = ProxyError;
+    type Future = std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Self::Response, Self::Error>> + Send>,
+    >;
+
+    fn call(&self, req: Request<hyper::body::Incoming>) -> Self::Future {
+        let svc = self.clone();
+        Box::pin(async move {
+            let method = req.method().clone();
+            let uri = req.uri().clone();
             svc.handle_session_api(method, &uri, req).await
         })
     }
 }
 
-impl ProxyService {
-    /// Route non-CONNECT HTTP requests to the session management API.
+impl SessionApiService {
+    /// Route HTTP requests to the session management API.
+    #[allow(dead_code)]
     async fn handle_session_api(
         self,
         method: Method,
@@ -368,6 +411,7 @@ impl ProxyService {
 
 // --- Session API handlers ---
 
+#[allow(dead_code)]
 async fn handle_create_session(
     store: Arc<SessionStore>,
     secret_store: Option<Arc<dyn crate::vault::SecretStore>>,
@@ -506,6 +550,7 @@ async fn handle_create_session(
     }
 }
 
+#[allow(dead_code)]
 fn handle_get_session(store: Arc<SessionStore>, session_id: &str) -> Response<Full<Bytes>> {
     match store.get(session_id) {
         Some(session) => {
@@ -525,6 +570,7 @@ fn handle_get_session(store: Arc<SessionStore>, session_id: &str) -> Response<Fu
     }
 }
 
+#[allow(dead_code)]
 async fn handle_delete_session(
     store: Arc<SessionStore>,
     session_id: &str,
@@ -550,6 +596,7 @@ async fn handle_delete_session(
     }
 }
 
+#[allow(dead_code)]
 fn handle_list_sessions(store: Arc<SessionStore>) -> Response<Full<Bytes>> {
     let sessions: Vec<SessionSummary> = store.list().iter().map(SessionSummary::from).collect();
     let resp = SessionListResponse { sessions };
@@ -557,6 +604,7 @@ fn handle_list_sessions(store: Arc<SessionStore>) -> Response<Full<Bytes>> {
     json_response(StatusCode::OK, &json)
 }
 
+#[allow(dead_code)]
 fn handle_health(store: Arc<SessionStore>, state: &ProxyState) -> Response<Full<Bytes>> {
     let uptime = crate::session::now_secs().saturating_sub(state.start_time);
     let body = format!(
@@ -578,6 +626,7 @@ fn json_response(status: StatusCode, body: &str) -> Response<Full<Bytes>> {
         .unwrap()
 }
 
+#[allow(dead_code)]
 fn error_response(status: StatusCode, code: &str, message: &str) -> Response<Full<Bytes>> {
     let body = format!(
         r#"{{"error":{{"code":"{}","message":"{}"}}}}"#,
@@ -587,6 +636,7 @@ fn error_response(status: StatusCode, code: &str, message: &str) -> Response<Ful
     json_response(status, &body)
 }
 
+#[allow(dead_code)]
 fn error_response_with_detail(
     status: StatusCode,
     code: &str,
@@ -928,10 +978,15 @@ mod integration_tests {
     use std::sync::Arc;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    /// Start a proxy with session store on a random port, return the address.
-    async fn start_test_proxy(
-        secret_store: Arc<dyn crate::vault::SecretStore>,
-    ) -> std::net::SocketAddr {
+    /// Test proxy handle: TCP address for CONNECT, unix socket path for REST API.
+    struct TestProxy {
+        tcp_addr: std::net::SocketAddr,
+        socket_path: String,
+    }
+
+    /// Start a proxy with session store. TCP listener handles CONNECT only,
+    /// unix socket listener handles the REST API.
+    async fn start_test_proxy(secret_store: Arc<dyn crate::vault::SecretStore>) -> TestProxy {
         let ca = Arc::new(Ca::generate().unwrap());
         let server_config = ca.server_config(&["api.openai.com".to_string()]).unwrap();
         let upstream_config = Ca::upstream_client_config_no_verify().unwrap();
@@ -961,24 +1016,54 @@ mod integration_tests {
             start_time: crate::session::now_secs(),
         };
 
+        // TCP listener for CONNECT
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
 
+        let tcp_state = state.clone();
         tokio::spawn(async move {
             while let Ok((stream, _)) = listener.accept().await {
-                let st = state.clone();
+                let st = tcp_state.clone();
                 tokio::spawn(async move {
                     let _ = handle_connection(stream, st).await;
                 });
             }
         });
 
-        addr
+        // Unix socket listener for REST API
+        let socket_path = format!("/tmp/ae-test-{}-{}.sock", std::process::id(), addr.port());
+        std::fs::remove_file(&socket_path).ok();
+        let unix_listener = tokio::net::UnixListener::bind(&socket_path).unwrap();
+
+        let unix_state = state.clone();
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = unix_listener.accept().await {
+                let st = unix_state.clone();
+                tokio::spawn(async move {
+                    let _ = handle_session_connection(stream, st).await;
+                });
+            }
+        });
+
+        TestProxy {
+            tcp_addr: addr,
+            socket_path,
+        }
     }
 
-    /// Send a raw HTTP request and return the response bytes.
-    async fn http_request(addr: std::net::SocketAddr, req: &str) -> Vec<u8> {
+    /// Send a raw HTTP request over TCP and return the response bytes.
+    async fn http_request_tcp(addr: std::net::SocketAddr, req: &str) -> Vec<u8> {
         let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        stream.write_all(req.as_bytes()).await.unwrap();
+        stream.flush().await.unwrap();
+        let mut resp = Vec::new();
+        stream.read_to_end(&mut resp).await.unwrap();
+        resp
+    }
+
+    /// Send a raw HTTP request over a unix socket and return the response bytes.
+    async fn http_request_unix(socket_path: &str, req: &str) -> Vec<u8> {
+        let mut stream = tokio::net::UnixStream::connect(socket_path).await.unwrap();
         stream.write_all(req.as_bytes()).await.unwrap();
         stream.flush().await.unwrap();
         let mut resp = Vec::new();
@@ -989,10 +1074,10 @@ mod integration_tests {
     #[tokio::test]
     async fn test_health_endpoint() {
         let store = Arc::new(MockSecretStore::new());
-        let addr = start_test_proxy(store).await;
+        let proxy = start_test_proxy(store).await;
 
-        let resp = http_request(
-            addr,
+        let resp = http_request_unix(
+            &proxy.socket_path,
             "GET /health HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
         )
         .await;
@@ -1012,7 +1097,7 @@ mod integration_tests {
             "sk-dum-test",
             "sk-real-test",
         );
-        let addr = start_test_proxy(secret_store).await;
+        let proxy = start_test_proxy(secret_store).await;
 
         // POST /sessions
         let body = r#"{"session_id":"sess_test1","source_ip":"10.0.1.42","allowlist":[{"domain":"api.openai.com","mode":"mitm","credential_ref":"vault://secret/data/test-key"}]}"#;
@@ -1021,15 +1106,15 @@ mod integration_tests {
             body.len(),
             body
         );
-        let resp = http_request(addr, &req).await;
+        let resp = http_request_unix(&proxy.socket_path, &req).await;
         let resp_str = String::from_utf8_lossy(&resp);
         assert!(resp_str.contains("201 Created"), "got: {resp_str}");
         assert!(resp_str.contains("sess_test1"));
         assert!(resp_str.contains("10.0.1.42"));
 
         // GET /sessions/sess_test1
-        let resp = http_request(
-            addr,
+        let resp = http_request_unix(
+            &proxy.socket_path,
             "GET /sessions/sess_test1 HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
         )
         .await;
@@ -1038,8 +1123,8 @@ mod integration_tests {
         assert!(resp_str.contains("sess_test1"));
 
         // GET /sessions
-        let resp = http_request(
-            addr,
+        let resp = http_request_unix(
+            &proxy.socket_path,
             "GET /sessions HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
         )
         .await;
@@ -1051,7 +1136,7 @@ mod integration_tests {
     #[tokio::test]
     async fn test_delete_session() {
         let secret_store = Arc::new(MockSecretStore::new());
-        let addr = start_test_proxy(secret_store).await;
+        let proxy = start_test_proxy(secret_store).await;
 
         // Create
         let body = r#"{"session_id":"sess_del","source_ip":"10.0.1.50","allowlist":[{"domain":"api.openai.com","mode":"tunnel"}]}"#;
@@ -1060,11 +1145,11 @@ mod integration_tests {
             body.len(),
             body
         );
-        let _ = http_request(addr, &req).await;
+        let _ = http_request_unix(&proxy.socket_path, &req).await;
 
         // DELETE
-        let resp = http_request(
-            addr,
+        let resp = http_request_unix(
+            &proxy.socket_path,
             "DELETE /sessions/sess_del HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
         )
         .await;
@@ -1072,8 +1157,8 @@ mod integration_tests {
         assert!(resp_str.contains("204"), "got: {resp_str}");
 
         // GET should 404
-        let resp = http_request(
-            addr,
+        let resp = http_request_unix(
+            &proxy.socket_path,
             "GET /sessions/sess_del HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
         )
         .await;
@@ -1085,7 +1170,7 @@ mod integration_tests {
     #[tokio::test]
     async fn test_create_session_invalid_credential_ref() {
         let secret_store = Arc::new(MockSecretStore::new());
-        let addr = start_test_proxy(secret_store).await;
+        let proxy = start_test_proxy(secret_store).await;
 
         let body = r#"{"session_id":"sess_bad","source_ip":"10.0.1.60","allowlist":[{"domain":"api.openai.com","mode":"mitm","credential_ref":"vault://secret/data/nonexistent"}]}"#;
         let req = format!(
@@ -1093,7 +1178,7 @@ mod integration_tests {
             body.len(),
             body
         );
-        let resp = http_request(addr, &req).await;
+        let resp = http_request_unix(&proxy.socket_path, &req).await;
         let resp_str = String::from_utf8_lossy(&resp);
         assert!(resp_str.contains("422"), "got: {resp_str}");
         assert!(resp_str.contains("CREDENTIAL_REF_INVALID"));
@@ -1102,7 +1187,7 @@ mod integration_tests {
     #[tokio::test]
     async fn test_create_session_duplicate() {
         let secret_store = Arc::new(MockSecretStore::new());
-        let addr = start_test_proxy(secret_store).await;
+        let proxy = start_test_proxy(secret_store).await;
 
         let body = r#"{"session_id":"sess_dup","source_ip":"10.0.1.70","allowlist":[{"domain":"api.openai.com","mode":"tunnel"}]}"#;
         let req = format!(
@@ -1110,7 +1195,7 @@ mod integration_tests {
             body.len(),
             body
         );
-        let _ = http_request(addr, &req).await;
+        let _ = http_request_unix(&proxy.socket_path, &req).await;
 
         // Second create with same ID
         let body2 = r#"{"session_id":"sess_dup","source_ip":"10.0.1.71","allowlist":[{"domain":"api.openai.com","mode":"tunnel"}]}"#;
@@ -1119,7 +1204,7 @@ mod integration_tests {
             body2.len(),
             body2
         );
-        let resp = http_request(addr, &req2).await;
+        let resp = http_request_unix(&proxy.socket_path, &req2).await;
         let resp_str = String::from_utf8_lossy(&resp);
         assert!(resp_str.contains("409"), "got: {resp_str}");
         assert!(resp_str.contains("SESSION_EXISTS"));
@@ -1128,10 +1213,10 @@ mod integration_tests {
     #[tokio::test]
     async fn test_connect_unregistered_ip_403() {
         let secret_store = Arc::new(MockSecretStore::new());
-        let addr = start_test_proxy(secret_store).await;
+        let proxy = start_test_proxy(secret_store).await;
 
-        let resp = http_request(
-            addr,
+        let resp = http_request_tcp(
+            proxy.tcp_addr,
             "CONNECT api.openai.com:443 HTTP/1.1\r\nHost: api.openai.com:443\r\nConnection: close\r\n\r\n",
         )
         .await;
@@ -1142,7 +1227,7 @@ mod integration_tests {
     #[tokio::test]
     async fn test_connect_non_allowlisted_domain_403() {
         let secret_store = Arc::new(MockSecretStore::new());
-        let addr = start_test_proxy(secret_store).await;
+        let proxy = start_test_proxy(secret_store).await;
 
         // Register a session for 127.0.0.1 (test connects from localhost)
         let body = r#"{"session_id":"sess_allow","source_ip":"127.0.0.1","allowlist":[{"domain":"api.openai.com","mode":"tunnel"}]}"#;
@@ -1151,11 +1236,11 @@ mod integration_tests {
             body.len(),
             body
         );
-        let _ = http_request(addr, &req).await;
+        let _ = http_request_unix(&proxy.socket_path, &req).await;
 
         // CONNECT to a non-allowlisted domain
-        let resp = http_request(
-            addr,
+        let resp = http_request_tcp(
+            proxy.tcp_addr,
             "CONNECT evil.com:443 HTTP/1.1\r\nHost: evil.com:443\r\nConnection: close\r\n\r\n",
         )
         .await;
@@ -1166,21 +1251,21 @@ mod integration_tests {
     #[tokio::test]
     async fn test_full_lifecycle() {
         let secret_store = Arc::new(MockSecretStore::new());
-        let addr = start_test_proxy(secret_store).await;
+        let proxy = start_test_proxy(secret_store).await;
 
-        // 1. Register session
+        // 1. Register session via unix socket
         let body = r#"{"session_id":"sess_life","source_ip":"127.0.0.1","allowlist":[{"domain":"api.openai.com","mode":"tunnel"}]}"#;
         let req = format!(
             "POST /sessions HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
             body.len(),
             body
         );
-        let resp = http_request(addr, &req).await;
+        let resp = http_request_unix(&proxy.socket_path, &req).await;
         assert!(String::from_utf8_lossy(&resp).contains("201"));
 
-        // 2. CONNECT to allowlisted domain should NOT get 403
-        let resp = http_request(
-            addr,
+        // 2. CONNECT to allowlisted domain via TCP should NOT get 403
+        let resp = http_request_tcp(
+            proxy.tcp_addr,
             "CONNECT api.openai.com:443 HTTP/1.1\r\nHost: api.openai.com:443\r\nConnection: close\r\n\r\n",
         )
         .await;
@@ -1190,17 +1275,17 @@ mod integration_tests {
             "CONNECT should not be 403 after registration: {resp_str}"
         );
 
-        // 3. Delete session
-        let resp = http_request(
-            addr,
+        // 3. Delete session via unix socket
+        let resp = http_request_unix(
+            &proxy.socket_path,
             "DELETE /sessions/sess_life HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
         )
         .await;
         assert!(String::from_utf8_lossy(&resp).contains("204"));
 
         // 4. CONNECT should now fail with 403
-        let resp = http_request(
-            addr,
+        let resp = http_request_tcp(
+            proxy.tcp_addr,
             "CONNECT api.openai.com:443 HTTP/1.1\r\nHost: api.openai.com:443\r\nConnection: close\r\n\r\n",
         )
         .await;
