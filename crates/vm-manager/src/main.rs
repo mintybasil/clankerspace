@@ -2,11 +2,27 @@
 //!
 //! Initializes tracing and starts the VM Manager HTTP server on 127.0.0.1:8080.
 
-mod vm_manager;
+mod api;
+mod error;
+mod helpers;
+mod network;
+mod proxy_client;
+mod state;
+mod types;
+mod vm;
+
+// Re-export constants from helpers for other modules
+mod constants {
+    pub const KERNEL_PATH: &str = "vmlinux-5.10-new.bin";
+    pub const PROXY_SOCKET_PATH: &str = "/run/ae-proxy.sock";
+    pub const PROXY_PORT: u16 = 9999;
+    pub const IP_POOL_BASE: [u8; 4] = [10, 0, 1, 0];
+}
 
 use std::net::SocketAddr;
 
-use vm_manager::{VmManagerState, run_server};
+use api::run_server;
+use state::VmManagerState;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
