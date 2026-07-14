@@ -29,6 +29,7 @@ fctools = { version = "0.7.0-alpha.2", features = [
     "vm",
     "direct-process-spawner",
     "unrestricted-vmm-executor",
+    "jailed-vmm-executor",
     "nix-syscall-backend",
 ] }
 time = { version = "0.3", features = ["parsing", "formatting"] }
