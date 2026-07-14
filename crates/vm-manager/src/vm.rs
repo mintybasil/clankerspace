@@ -19,7 +19,7 @@ use fctools::vmm::resource::{MovedResourceType, ResourceType};
 use tokio::sync::{mpsc, oneshot};
 use tracing::{error, info, warn};
 
-use crate::network::{cleanup_nftables, cleanup_tap_interface};
+use crate::network::{cleanup_tap_interface, remove_dnat_rule};
 use crate::proxy_client::delete_proxy_session;
 use crate::state::{EnvironmentState, VmManagerState};
 
@@ -64,7 +64,7 @@ pub async fn run_vm_lifecycle(
             }
             // Cleanup proxy session and TAP
             let _ = delete_proxy_session(&state.proxy_socket, &session_id).await;
-            let _ = cleanup_nftables(&session_id).await;
+            let _ = remove_dnat_rule(&tap_interface).await;
             let _ = cleanup_tap_interface(&tap_interface).await;
             state.release_ip(&vm_ip).await;
             // Remove shutdown and serial handles
@@ -149,7 +149,7 @@ pub async fn run_vm_lifecycle(
     info!(session_id = %session_id, "cleaning up environment");
 
     let _ = delete_proxy_session(&state.proxy_socket, &session_id).await;
-    let _ = cleanup_nftables(&session_id).await;
+    let _ = remove_dnat_rule(&tap_interface).await;
     let _ = cleanup_tap_interface(&tap_interface).await;
     state.release_ip(&vm_ip).await;
 
