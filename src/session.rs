@@ -69,6 +69,7 @@ pub struct Session {
 
 /// REST API request body for `POST /sessions`.
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 pub struct CreateSessionRequest {
     pub session_id: String,
     pub source_ip: String,
@@ -78,6 +79,7 @@ pub struct CreateSessionRequest {
 
 /// REST API response for session details.
 #[derive(Debug, Serialize)]
+#[allow(dead_code)]
 pub struct SessionResponse {
     pub session_id: String,
     pub source_ip: String,
@@ -94,11 +96,13 @@ pub struct SessionResponse {
 
 /// REST API response for `GET /sessions` (list).
 #[derive(Debug, Serialize)]
+#[allow(dead_code)]
 pub struct SessionListResponse {
     pub sessions: Vec<SessionSummary>,
 }
 
 #[derive(Debug, Serialize)]
+#[allow(dead_code)]
 pub struct SessionSummary {
     pub session_id: String,
     pub source_ip: String,
@@ -299,6 +303,7 @@ impl SessionStore {
     }
 
     /// Get a session by session_id.
+    #[allow(dead_code)]
     pub fn get(&self, session_id: &str) -> Option<Session> {
         let map = self.sessions.lock().unwrap();
         map.values().find(|s| s.session_id == session_id).cloned()
@@ -311,6 +316,7 @@ impl SessionStore {
     }
 
     /// Delete a session by session_id. Removes from both SQLite and memory.
+    #[allow(dead_code)]
     pub fn delete(&self, session_id: &str) -> Result<bool, SessionError> {
         // Find the session to get its source_ip (for memory map removal)
         let source_ip = {
@@ -349,12 +355,14 @@ impl SessionStore {
     }
 
     /// List all active sessions.
+    #[allow(dead_code)]
     pub fn list(&self) -> Vec<Session> {
         let map = self.sessions.lock().unwrap();
         map.values().cloned().collect()
     }
 
     /// Get the count of active sessions.
+    #[allow(dead_code)]
     pub fn count(&self) -> usize {
         self.sessions.lock().unwrap().len()
     }
@@ -376,6 +384,7 @@ impl SessionStore {
     }
 
     /// Get stats for a session.
+    #[allow(dead_code)]
     pub fn get_stats(&self, session_id: &str) -> Option<SessionStats> {
         self.stats.lock().unwrap().get(session_id).cloned()
     }
@@ -393,6 +402,7 @@ impl SessionStore {
     }
 }
 
+#[allow(dead_code)]
 fn log(msg: &str) {
     eprintln!("[session] {msg}");
 }
@@ -407,6 +417,7 @@ pub fn now_secs() -> u64 {
 
 /// Parse an ISO 8601 timestamp string into Unix seconds.
 /// Returns None if parsing fails or the string is empty.
+#[allow(dead_code)]
 pub fn parse_iso8601(s: &str) -> Option<u64> {
     if s.is_empty() {
         return None;
@@ -421,6 +432,7 @@ pub fn parse_iso8601(s: &str) -> Option<u64> {
 
 /// Format a Unix timestamp (seconds) as an ISO 8601 / RFC 3339 string.
 /// Returns None if the timestamp is 0.
+#[allow(dead_code)]
 pub fn format_iso8601(ts: u64) -> Option<String> {
     if ts == 0 {
         return None;
