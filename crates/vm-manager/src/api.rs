@@ -360,6 +360,7 @@ impl VmManagerState {
         let vm_ip_for_task = vm_ip.clone();
         let host_tap_ip_for_task = host_tap_ip.clone();
         let tap_interface_for_task = tap_interface.clone();
+        let files_for_task = create_req.files.clone();
 
         tokio::spawn(async move {
             run_vm_lifecycle(
@@ -374,6 +375,7 @@ impl VmManagerState {
                 shutdown_rx,
                 vcpus,
                 memory_mib,
+                files_for_task,
             )
             .await;
         });

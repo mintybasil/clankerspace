@@ -4,6 +4,7 @@
 
 mod api;
 mod error;
+mod file_injection;
 mod helpers;
 mod network;
 mod proxy_client;
