@@ -10,6 +10,10 @@ repository = "https://github.com/mintybasil/ae-poc"
 name = "ae-poc"
 path = "src/main.rs"
 
+[[bin]]
+name = "vm-manager"
+path = "src/bin/vm_manager.rs"
+
 [dependencies]
 # Egress proxy deps (from ae-egress-proxy)
 tokio = { version = "1", features = ["full"] }
