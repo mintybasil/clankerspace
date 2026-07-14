@@ -269,13 +269,28 @@ impl ProxyService {
                 }
             };
 
-            // Use session API key if available, otherwise fall back to global key
-            let effective_key = session_api_key.as_deref().unwrap_or(&self.state.api_key);
-            let forwarded = rewrite_request(&req_bytes, effective_key, &host);
-            log(&format!(
-                "MITM: forwarding {host} request ({} bytes)",
-                forwarded.len()
-            ));
+            // Check if this is a WebSocket upgrade request
+            let is_websocket = is_websocket_upgrade(&req_bytes);
+
+            let forwarded = if is_websocket {
+                // WebSocket: pass headers through without modification.
+                // The bidirectional copy handles WebSocket frames (just bytes).
+                // Don't strip Authorization or inject keys — WebSocket
+                // upgrade must be transparent.
+                log(&format!(
+                    "MITM: WebSocket upgrade for {host} — passing through"
+                ));
+                req_bytes
+            } else {
+                // Normal HTTP: rewrite Authorization header
+                let effective_key = session_api_key.as_deref().unwrap_or(&self.state.api_key);
+                let rewritten = rewrite_request(&req_bytes, effective_key, &host);
+                log(&format!(
+                    "MITM: forwarding {host} request ({} bytes)",
+                    rewritten.len()
+                ));
+                rewritten
+            };
 
             if let Err(e) = tls_upstream.write_all(&forwarded).await {
                 log(&format!("write to upstream {host}: {e}"));
@@ -816,6 +831,23 @@ fn find_terminator(buf: &[u8], start: usize) -> Option<usize> {
     None
 }
 
+/// Check if the raw HTTP request is a WebSocket upgrade request.
+///
+/// Detects `Connection: Upgrade` and `Upgrade: websocket` headers
+/// (case-insensitive). When true, the proxy passes the request through
+/// without modification — WebSocket upgrade headers must be preserved
+/// and the bidirectional copy handles WebSocket frames as raw bytes.
+fn is_websocket_upgrade(raw: &[u8]) -> bool {
+    let text = String::from_utf8_lossy(raw);
+    let has_upgrade = text
+        .lines()
+        .any(|line| line.eq_ignore_ascii_case("connection: upgrade"));
+    let has_websocket = text
+        .lines()
+        .any(|line| line.to_lowercase().contains("upgrade: websocket"));
+    has_upgrade && has_websocket
+}
+
 fn rewrite_request(raw: &[u8], api_key: &str, host: &str) -> Vec<u8> {
     let text = String::from_utf8_lossy(raw);
     let mut lines: Vec<String> = text.split("\r\n").map(String::from).collect();
@@ -901,6 +933,38 @@ mod tests {
         let state = test_state();
         assert!(is_allowlisted(&state, "api.openai.com"));
         assert!(!is_allowlisted(&state, "evil.com"));
+    }
+
+    // --- WebSocket detection tests ---
+
+    #[test]
+    fn test_is_websocket_upgrade_detected() {
+        let req = b"GET /ws HTTP/1.1\r\nHost: api.openai.com\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n";
+        assert!(is_websocket_upgrade(req));
+    }
+
+    #[test]
+    fn test_is_websocket_upgrade_case_insensitive() {
+        let req = b"GET /ws HTTP/1.1\r\nHost: api.openai.com\r\nconnection: upgrade\r\nupgrade: WebSocket\r\n\r\n";
+        assert!(is_websocket_upgrade(req));
+    }
+
+    #[test]
+    fn test_is_websocket_upgrade_missing_connection() {
+        let req = b"GET /ws HTTP/1.1\r\nHost: api.openai.com\r\nUpgrade: websocket\r\n\r\n";
+        assert!(!is_websocket_upgrade(req));
+    }
+
+    #[test]
+    fn test_is_websocket_upgrade_missing_upgrade() {
+        let req = b"GET /ws HTTP/1.1\r\nHost: api.openai.com\r\nConnection: Upgrade\r\n\r\n";
+        assert!(!is_websocket_upgrade(req));
+    }
+
+    #[test]
+    fn test_is_websocket_upgrade_normal_request() {
+        let req = b"GET /v1/models HTTP/1.1\r\nHost: api.openai.com\r\nAuthorization: Bearer sk-dum\r\n\r\n";
+        assert!(!is_websocket_upgrade(req));
     }
 
     // --- httparse parser tests ---
