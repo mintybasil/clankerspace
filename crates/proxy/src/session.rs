@@ -222,10 +222,7 @@ impl SessionStore {
             map.insert(session.source_ip.clone(), session);
         }
 
-        log(&format!(
-            "Session store loaded: {} active session(s)",
-            map.len()
-        ));
+        tracing::info!(active_sessions = map.len(), "Session store loaded");
 
         Ok(Arc::new(SessionStore {
             conn: std::sync::Mutex::new(conn),
@@ -400,11 +397,6 @@ impl SessionStore {
             false
         }
     }
-}
-
-#[allow(dead_code)]
-fn log(msg: &str) {
-    tracing::info!("{}", msg);
 }
 
 /// Get the current Unix timestamp in seconds.
