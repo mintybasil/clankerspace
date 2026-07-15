@@ -53,7 +53,7 @@ pub struct AllowlistEntry {
     pub credential_ref: Option<String>,
 }
 
-/// A proxy session. Persisted to SQLite (minus `api_key` which is memory-only).
+/// A proxy session. Persisted to SQLite (minus memory-only fields).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Session {
     pub session_id: String,
@@ -63,8 +63,16 @@ pub struct Session {
     pub expires_at: Option<u64>, // Unix timestamp (seconds), None = no expiry
 
     /// API key held in memory only — never persisted to SQLite.
+    /// Used in PoC mode (single key fallback).
     #[serde(skip)]
     pub api_key: Option<String>,
+
+    /// Dummy→real key map held in memory only — never persisted to SQLite.
+    /// Used in session mode for MITM key swapping. The proxy extracts the
+    /// dummy key from the agent's `Authorization` header, looks it up here,
+    /// and replaces it with the real key before forwarding upstream.
+    #[serde(skip)]
+    pub dummy_to_real: HashMap<String, String>,
 }
 
 /// REST API request body for `POST /sessions`.
@@ -214,6 +222,7 @@ impl SessionStore {
                     created_at: row.get::<_, i64>(3)? as u64,
                     expires_at: expires_at.map(|v| v as u64),
                     api_key: None, // Not persisted — re-fetched from Vault on restart
+                    dummy_to_real: HashMap::new(),
                 })
             })?;
             rows.filter_map(|r| r.ok()).collect()
@@ -291,8 +300,9 @@ impl SessionStore {
         }
 
         // Insert into in-memory map
-        // Ensure api_key is None (don't persist)
+        // Ensure memory-only fields are cleared (don't persist)
         session.api_key = None;
+        session.dummy_to_real = HashMap::new();
         let mut map = self.sessions.lock().unwrap();
         map.insert(session.source_ip.clone(), session);
 
@@ -387,11 +397,25 @@ impl SessionStore {
     }
 
     /// Set the API key for a session (memory only, not persisted).
+    /// Used in PoC mode or as a single-key fallback.
     #[allow(dead_code)]
     pub fn set_api_key(&self, session_id: &str, api_key: String) -> bool {
         let mut map = self.sessions.lock().unwrap();
         if let Some(session) = map.values_mut().find(|s| s.session_id == session_id) {
             session.api_key = Some(api_key);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Set the dummy→real key map for a session (memory only, not persisted).
+    /// Used in session mode for MITM key swapping.
+    #[allow(dead_code)]
+    pub fn set_key_map(&self, session_id: &str, dummy_to_real: HashMap<String, String>) -> bool {
+        let mut map = self.sessions.lock().unwrap();
+        if let Some(session) = map.values_mut().find(|s| s.session_id == session_id) {
+            session.dummy_to_real = dummy_to_real;
             true
         } else {
             false
@@ -451,6 +475,7 @@ mod tests {
             created_at: now_secs(),
             expires_at: Some(now_secs() + 3600),
             api_key: Some("sk-test-key".to_string()),
+            dummy_to_real: HashMap::new(),
         }
     }
 
@@ -587,6 +612,70 @@ mod tests {
         let store = SessionStore::in_memory().unwrap();
         let set = store.set_api_key("nonexistent", "sk-key".to_string());
         assert!(!set);
+    }
+
+    #[test]
+    fn test_set_key_map() {
+        let store = SessionStore::in_memory().unwrap();
+        store
+            .create(make_session("sess_keymap", "10.0.1.92"))
+            .unwrap();
+
+        // dummy_to_real is empty after create
+        assert!(store.get("sess_keymap").unwrap().dummy_to_real.is_empty());
+
+        // Set the dummy→real map
+        let mut map = HashMap::new();
+        map.insert("sk-dummy-1".to_string(), "sk-real-1".to_string());
+        map.insert("sk-dummy-2".to_string(), "sk-real-2".to_string());
+        let set = store.set_key_map("sess_keymap", map);
+        assert!(set);
+
+        let session = store.get("sess_keymap").unwrap();
+        assert_eq!(session.dummy_to_real.len(), 2);
+        assert_eq!(
+            session.dummy_to_real.get("sk-dummy-1"),
+            Some(&"sk-real-1".to_string())
+        );
+        assert_eq!(
+            session.dummy_to_real.get("sk-dummy-2"),
+            Some(&"sk-real-2".to_string())
+        );
+    }
+
+    #[test]
+    fn test_set_key_map_nonexistent() {
+        let store = SessionStore::in_memory().unwrap();
+        let map = HashMap::new();
+        let set = store.set_key_map("nonexistent", map);
+        assert!(!set);
+    }
+
+    #[test]
+    fn test_key_map_not_persisted() {
+        let db_path = "/tmp/ae-poc-test-session-keymap-persist.sqlite";
+        let _ = std::fs::remove_file(db_path);
+
+        {
+            let store = SessionStore::open(db_path).unwrap();
+            store
+                .create(make_session("sess_km_persist", "10.0.1.140"))
+                .unwrap();
+
+            let mut map = HashMap::new();
+            map.insert("sk-dummy".to_string(), "sk-real".to_string());
+            store.set_key_map("sess_km_persist", map);
+            assert_eq!(store.get("sess_km_persist").unwrap().dummy_to_real.len(), 1);
+        }
+
+        // Reopen — dummy_to_real should be empty (not persisted)
+        {
+            let store = SessionStore::open(db_path).unwrap();
+            let session = store.get("sess_km_persist").unwrap();
+            assert!(session.dummy_to_real.is_empty());
+        }
+
+        let _ = std::fs::remove_file(db_path);
     }
 
     // --- SQLite persistence tests ---

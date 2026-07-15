@@ -5,6 +5,7 @@
 //! approach is that hyper's upgrade mechanism properly handles the
 //! transition from HTTP to raw bytes, including any buffered data.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -115,7 +116,7 @@ impl ProxyService {
         };
 
         // Session-based allowlist check (production mode)
-        let mut session_api_key: Option<String> = None;
+        let mut session_key_map: Option<HashMap<String, String>> = None;
         if let Some(store) = &self.state.sessions {
             let peer_ip = self.peer.map(|a| a.ip().to_string());
             let session = peer_ip.and_then(|ip| store.get_by_ip(&ip));
@@ -145,8 +146,8 @@ impl ProxyService {
 
             tracing::info!(host = %host, port = port, session_id = %session.session_id, "ALLOW: CONNECT");
 
-            // Capture the session's API key for MITM injection
-            session_api_key = session.api_key.clone();
+            // Capture the session's dummy→real key map for MITM swapping
+            session_key_map = Some(session.dummy_to_real.clone());
             let _session = session; // keep alive for the upgrade handler
         } else {
             // PoC mode — global allowlist
@@ -257,10 +258,40 @@ impl ProxyService {
                 req_bytes
             } else {
                 // Normal HTTP: rewrite Authorization header
-                let effective_key = session_api_key.as_deref().unwrap_or(&self.state.api_key);
-                let rewritten = rewrite_request(&req_bytes, effective_key, &host);
-                tracing::info!(host = %host, bytes = rewritten.len(), "MITM: forwarding request");
-                rewritten
+                match session_key_map.as_ref() {
+                    Some(key_map) if !key_map.is_empty() => {
+                        // Session mode: dummy→real key swap
+                        match rewrite_request(&req_bytes, key_map, &host) {
+                            Ok(rewritten) => {
+                                tracing::info!(host = %host, bytes = rewritten.len(), "MITM: forwarding request (key swapped)");
+                                rewritten
+                            }
+                            Err(RewriteError::UnknownDummyKey(key)) => {
+                                tracing::warn!(host = %host, key = %key, "DROP: unknown dummy key in Authorization header");
+                                // Send 403 back to the client
+                                let resp = b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n";
+                                if let Err(e) = tls_upstream.write_all(resp).await {
+                                    tracing::error!(host = %host, error = %e, "failed to write 403 to client");
+                                }
+                                return;
+                            }
+                            Err(RewriteError::NoAuthHeader) => {
+                                tracing::warn!(host = %host, "DROP: no Authorization header in request");
+                                let resp = b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n";
+                                if let Err(e) = tls_upstream.write_all(resp).await {
+                                    tracing::error!(host = %host, error = %e, "failed to write 403 to client");
+                                }
+                                return;
+                            }
+                        }
+                    }
+                    _ => {
+                        // PoC mode: single key injection (fallback)
+                        let rewritten = rewrite_request_poc(&req_bytes, &self.state.api_key, &host);
+                        tracing::info!(host = %host, bytes = rewritten.len(), "MITM: forwarding request (PoC mode)");
+                        rewritten
+                    }
+                }
             };
 
             if let Err(e) = tls_upstream.write_all(&forwarded).await {
@@ -491,24 +522,24 @@ async fn handle_create_session(
         allowlist: create_req.allowlist.clone(),
         created_at: now,
         expires_at,
-        api_key: None, // Real keys held in memory via set_api_key, not persisted
+        api_key: None, // Real keys held in memory via set_key_map, not persisted
+        dummy_to_real: HashMap::new(), // Set via set_key_map after create
     };
 
     let session_id = session.session_id.clone();
 
+    // Build the dummy→real key map from resolved pairs.
+    // Multiple mitm entries with different credential_refs are all included.
+    let dummy_to_real: HashMap<String, String> = resolved_pairs
+        .values()
+        .map(|pair| (pair.dummy.clone(), pair.real.clone()))
+        .collect();
+
     match store.create(session) {
         Ok(()) => {
-            // Store the real key for the session (in memory only)
-            // For now, one key per session (first mitm entry).
-            // TODO: support multiple keys per session via dummy→real map.
-            for entry in &create_req.allowlist {
-                if entry.mode == "mitm"
-                    && let Some(ref cref) = entry.credential_ref
-                    && let Some(pair) = resolved_pairs.get(cref)
-                {
-                    store.set_api_key(&session_id, pair.real.clone());
-                    break;
-                }
+            // Store the dummy→real key map in the session (in memory only)
+            if !dummy_to_real.is_empty() {
+                store.set_key_map(&session_id, dummy_to_real);
             }
 
             let session = store.get(&session_id).unwrap();
@@ -819,7 +850,82 @@ fn is_websocket_upgrade(raw: &[u8]) -> bool {
     has_upgrade && has_websocket
 }
 
-fn rewrite_request(raw: &[u8], api_key: &str, host: &str) -> Vec<u8> {
+/// Error returned when `rewrite_request` cannot proceed.
+#[derive(Debug)]
+enum RewriteError {
+    /// The request had no `Authorization` header.
+    NoAuthHeader,
+    /// The dummy key in the `Authorization` header was not found in the
+    /// session's dummy→real map.
+    UnknownDummyKey(String),
+}
+
+/// Rewrite an HTTP request for MITM forwarding: extract the dummy key from
+/// the `Authorization: Bearer <key>` header, look it up in the session's
+/// dummy→real map, and replace it with the real key. Also rewrites the
+/// `Host` header to match the upstream host.
+///
+/// Returns `Err(RewriteError)` if the request has no `Authorization` header
+/// or the dummy key is not in the map — the caller should return 403.
+fn rewrite_request(
+    raw: &[u8],
+    dummy_to_real: &HashMap<String, String>,
+    host: &str,
+) -> Result<Vec<u8>, RewriteError> {
+    let text = String::from_utf8_lossy(raw);
+    let mut lines: Vec<String> = text.split("\r\n").map(String::from).collect();
+
+    // Extract the dummy key from the Authorization header
+    let dummy_key = lines
+        .iter()
+        .find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            if name.trim().eq_ignore_ascii_case("authorization") {
+                let token = value.trim();
+                token.strip_prefix("Bearer ").map(|k| k.trim().to_string())
+            } else {
+                None
+            }
+        })
+        .ok_or(RewriteError::NoAuthHeader)?;
+
+    // Look up the dummy key in the session's dummy→real map
+    let real_key = dummy_to_real
+        .get(&dummy_key)
+        .ok_or_else(|| RewriteError::UnknownDummyKey(dummy_key.clone()))?;
+
+    // Strip the old Authorization header
+    lines.retain(|line| {
+        if let Some((name, _)) = line.split_once(':') {
+            !name.trim().eq_ignore_ascii_case("authorization")
+        } else {
+            true
+        }
+    });
+
+    // Rewrite the Host header
+    for line in lines.iter_mut() {
+        if let Some((name, _)) = line.split_once(':')
+            && name.trim().eq_ignore_ascii_case("host")
+        {
+            *line = format!("Host: {host}");
+        }
+    }
+
+    // Inject the real key
+    let auth_header = format!("Authorization: Bearer {real_key}");
+    if lines.len() > 1 {
+        lines.insert(1, auth_header);
+    }
+
+    let joined = lines.join("\r\n");
+    Ok(joined.into_bytes())
+}
+
+/// PoC-mode request rewrite: strip the client's Authorization header and
+/// inject the global API key. This is the fallback used when no session
+/// store is configured (PoC mode with a single global key).
+fn rewrite_request_poc(raw: &[u8], api_key: &str, host: &str) -> Vec<u8> {
     let text = String::from_utf8_lossy(raw);
     let mut lines: Vec<String> = text.split("\r\n").map(String::from).collect();
 
@@ -839,7 +945,7 @@ fn rewrite_request(raw: &[u8], api_key: &str, host: &str) -> Vec<u8> {
         }
     }
 
-    let auth_header = format!("Authorization: Bearer {}", api_key);
+    let auth_header = format!("Authorization: Bearer {api_key}");
     if lines.len() > 1 {
         lines.insert(1, auth_header);
     }
@@ -882,13 +988,75 @@ mod tests {
     }
 
     #[test]
-    fn rewrite_strips_client_auth_and_injects_real_key() {
+    fn rewrite_poc_strips_client_auth_and_injects_real_key() {
         let state = test_state();
-        let raw = b"GET /v1/models HTTP/1.1\r\nHost: api.openai.com\r\nAuthorization: Bearer PLACEHOLDER\r\n";
-        let out = rewrite_request(raw, &state.api_key, "api.openai.com");
+        let raw = b"GET /v1/models HTTP/1.1\r\nHost: api.openai.com\r\nAuthorization: Bearer PLACEHOLDER\r\n\r\n";
+        let out = rewrite_request_poc(raw, &state.api_key, "api.openai.com");
         let s = String::from_utf8_lossy(&out);
         assert!(s.contains("Authorization: Bearer sk-REAL-KEY"));
         assert!(!s.contains("PLACEHOLDER"));
+    }
+
+    #[test]
+    fn rewrite_dummy_to_real_swap() {
+        let mut map = HashMap::new();
+        map.insert("sk-dummy-abc".to_string(), "sk-real-xyz".to_string());
+        let raw = b"GET /v1/models HTTP/1.1\r\nHost: api.openai.com\r\nAuthorization: Bearer sk-dummy-abc\r\n\r\n";
+        let out = rewrite_request(raw, &map, "api.openai.com").unwrap();
+        let s = String::from_utf8_lossy(&out);
+        assert!(s.contains("Authorization: Bearer sk-real-xyz"));
+        assert!(!s.contains("sk-dummy-abc"));
+    }
+
+    #[test]
+    fn rewrite_unknown_dummy_key_returns_err() {
+        let mut map = HashMap::new();
+        map.insert("sk-dummy-known".to_string(), "sk-real-known".to_string());
+        let raw = b"GET /v1/models HTTP/1.1\r\nHost: api.openai.com\r\nAuthorization: Bearer sk-dummy-unknown\r\n\r\n";
+        let result = rewrite_request(raw, &map, "api.openai.com");
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            RewriteError::UnknownDummyKey(key) => assert_eq!(key, "sk-dummy-unknown"),
+            e => panic!("expected UnknownDummyKey, got {e:?}"),
+        }
+    }
+
+    #[test]
+    fn rewrite_no_auth_header_returns_err() {
+        let map = HashMap::new();
+        let raw = b"GET /v1/models HTTP/1.1\r\nHost: api.openai.com\r\n\r\n";
+        let result = rewrite_request(raw, &map, "api.openai.com");
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            RewriteError::NoAuthHeader => {}
+            e => panic!("expected NoAuthHeader, got {e:?}"),
+        }
+    }
+
+    #[test]
+    fn rewrite_multiple_keys_in_map() {
+        let mut map = HashMap::new();
+        map.insert("sk-dummy-1".to_string(), "sk-real-1".to_string());
+        map.insert("sk-dummy-2".to_string(), "sk-real-2".to_string());
+        // Request with first dummy key
+        let raw1 = b"GET /v1/models HTTP/1.1\r\nHost: api.openai.com\r\nAuthorization: Bearer sk-dummy-1\r\n\r\n";
+        let out1 = rewrite_request(raw1, &map, "api.openai.com").unwrap();
+        assert!(String::from_utf8_lossy(&out1).contains("sk-real-1"));
+        // Request with second dummy key
+        let raw2 = b"GET /v1/models HTTP/1.1\r\nHost: api.openai.com\r\nAuthorization: Bearer sk-dummy-2\r\n\r\n";
+        let out2 = rewrite_request(raw2, &map, "api.openai.com").unwrap();
+        assert!(String::from_utf8_lossy(&out2).contains("sk-real-2"));
+    }
+
+    #[test]
+    fn rewrite_host_header_updated() {
+        let mut map = HashMap::new();
+        map.insert("sk-dummy".to_string(), "sk-real".to_string());
+        let raw = b"GET /v1/models HTTP/1.1\r\nHost: api.original.com\r\nAuthorization: Bearer sk-dummy\r\n\r\n";
+        let out = rewrite_request(raw, &map, "api.upstream.com").unwrap();
+        let s = String::from_utf8_lossy(&out);
+        assert!(s.contains("Host: api.upstream.com"));
+        assert!(!s.contains("api.original.com"));
     }
 
     #[test]
