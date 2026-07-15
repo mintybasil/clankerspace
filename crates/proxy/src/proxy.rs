@@ -43,16 +43,11 @@ impl From<std::io::Error> for ProxyError {
 pub struct ProxyState {
     pub server_config: Arc<rustls::ServerConfig>,
     pub upstream_config: Arc<rustls::ClientConfig>,
-    /// Global allowlist (PoC mode — used when no session store is configured).
-    pub allowlist: Vec<String>,
-    /// API key for PoC mode (global, no session store).
-    pub api_key: String,
     pub upstream_port: u16,
     pub upstream_host: String,
     pub expected_vm_ip: String,
-    /// Session store for production mode (per-session allowlist, source-IP lookup).
-    /// When set, takes precedence over the global allowlist.
-    pub sessions: Option<Arc<SessionStore>>,
+    /// Session store for per-session allowlist and key-map lookup.
+    pub sessions: Arc<SessionStore>,
     /// Secret store for credential resolution (Vault in prod, mock in tests).
     pub secret_store: Option<Arc<dyn crate::vault::SecretStore>>,
     /// CA cert SHA-256 fingerprint (hex with colons) for health endpoint.
@@ -115,9 +110,9 @@ impl ProxyService {
             None => (host_port.clone(), 443),
         };
 
-        // Session-based allowlist check (production mode)
-        let mut session_key_map: Option<HashMap<String, String>> = None;
-        if let Some(store) = &self.state.sessions {
+        // Session-based allowlist check + key map capture
+        let session_key_map: Option<HashMap<String, String>> = {
+            let store = &self.state.sessions;
             let peer_ip = self.peer.map(|a| a.ip().to_string());
             let session = peer_ip.and_then(|ip| store.get_by_ip(&ip));
 
@@ -147,19 +142,8 @@ impl ProxyService {
             tracing::info!(host = %host, port = port, session_id = %session.session_id, "ALLOW: CONNECT");
 
             // Capture the session's dummy→real key map for MITM swapping
-            session_key_map = Some(session.dummy_to_real.clone());
-            let _session = session; // keep alive for the upgrade handler
-        } else {
-            // PoC mode — global allowlist
-            if !is_allowlisted(&self.state, &host) {
-                tracing::warn!(host = %host, peer = ?self.peer, "DROP: not in allowlist");
-                let mut resp = Response::new(Full::new(Bytes::new()));
-                *resp.status_mut() = StatusCode::FORBIDDEN;
-                return Ok(resp);
-            }
-
-            tracing::info!(host = %host, port = port, "ALLOW: upgrading to MITM TLS");
-        }
+            Some(session.dummy_to_real.clone())
+        };
 
         let mut resp = Response::new(Full::new(Bytes::new()));
         *resp.status_mut() = StatusCode::OK;
@@ -257,39 +241,28 @@ impl ProxyService {
                 tracing::info!(host = %host, "MITM: WebSocket upgrade — passing through");
                 req_bytes
             } else {
-                // Normal HTTP: rewrite Authorization header
-                match session_key_map.as_ref() {
-                    Some(key_map) if !key_map.is_empty() => {
-                        // Session mode: dummy→real key swap
-                        match rewrite_request(&req_bytes, key_map, &host) {
-                            Ok(rewritten) => {
-                                tracing::info!(host = %host, bytes = rewritten.len(), "MITM: forwarding request (key swapped)");
-                                rewritten
-                            }
-                            Err(RewriteError::UnknownDummyKey(key)) => {
-                                tracing::warn!(host = %host, key = %key, "DROP: unknown dummy key in Authorization header");
-                                // Send 403 back to the client
-                                let resp = b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n";
-                                if let Err(e) = tls_upstream.write_all(resp).await {
-                                    tracing::error!(host = %host, error = %e, "failed to write 403 to client");
-                                }
-                                return;
-                            }
-                            Err(RewriteError::NoAuthHeader) => {
-                                tracing::warn!(host = %host, "DROP: no Authorization header in request");
-                                let resp = b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n";
-                                if let Err(e) = tls_upstream.write_all(resp).await {
-                                    tracing::error!(host = %host, error = %e, "failed to write 403 to client");
-                                }
-                                return;
-                            }
-                        }
-                    }
-                    _ => {
-                        // PoC mode: single key injection (fallback)
-                        let rewritten = rewrite_request_poc(&req_bytes, &self.state.api_key, &host);
-                        tracing::info!(host = %host, bytes = rewritten.len(), "MITM: forwarding request (PoC mode)");
+                // Normal HTTP: dummy→real key swap
+                let key_map = session_key_map.as_ref().expect("session key map must be set");
+                match rewrite_request(&req_bytes, key_map, &host) {
+                    Ok(rewritten) => {
+                        tracing::info!(host = %host, bytes = rewritten.len(), "MITM: forwarding request (key swapped)");
                         rewritten
+                    }
+                    Err(RewriteError::UnknownDummyKey(key)) => {
+                        tracing::warn!(host = %host, key = %key, "DROP: unknown dummy key in Authorization header");
+                        let resp = b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n";
+                        if let Err(e) = tls_upstream.write_all(resp).await {
+                            tracing::error!(host = %host, error = %e, "failed to write 403 to client");
+                        }
+                        return;
+                    }
+                    Err(RewriteError::NoAuthHeader) => {
+                        tracing::warn!(host = %host, "DROP: no Authorization header in request");
+                        let resp = b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n";
+                        if let Err(e) = tls_upstream.write_all(resp).await {
+                            tracing::error!(host = %host, error = %e, "failed to write 403 to client");
+                        }
+                        return;
                     }
                 }
             };
@@ -380,16 +353,8 @@ impl SessionApiService {
     ) -> Result<Response<Full<Bytes>>, ProxyError> {
         let path = uri.path();
 
-        // Only handle session routes when a session store is configured
-        let store = match &self.state.sessions {
-            Some(s) => s.clone(),
-            None => {
-                return Ok(json_response(
-                    StatusCode::NOT_FOUND,
-                    r#"{"error":{"code":"INVALID_REQUEST","message":"session API not enabled (no session store configured)"}}"#,
-                ));
-            }
-        };
+        // Session store is always configured
+        let store = self.state.sessions.clone();
 
         // Route: POST /sessions
         if path == "/sessions" && method == Method::POST {
@@ -522,7 +487,6 @@ async fn handle_create_session(
         allowlist: create_req.allowlist.clone(),
         created_at: now,
         expires_at,
-        api_key: None, // Real keys held in memory via set_key_map, not persisted
         dummy_to_real: HashMap::new(), // Set via set_key_map after create
     };
 
@@ -667,11 +631,6 @@ fn error_response_with_detail(
         detail.replace('"', "\\\"")
     );
     json_response(status, &body)
-}
-
-fn is_allowlisted(state: &ProxyState, host: &str) -> bool {
-    let h = host.to_lowercase();
-    state.allowlist.iter().any(|a| a.to_lowercase() == h)
 }
 
 /// Read a complete HTTP/1.1 request from a stream using httparse for header
@@ -922,38 +881,6 @@ fn rewrite_request(
     Ok(joined.into_bytes())
 }
 
-/// PoC-mode request rewrite: strip the client's Authorization header and
-/// inject the global API key. This is the fallback used when no session
-/// store is configured (PoC mode with a single global key).
-fn rewrite_request_poc(raw: &[u8], api_key: &str, host: &str) -> Vec<u8> {
-    let text = String::from_utf8_lossy(raw);
-    let mut lines: Vec<String> = text.split("\r\n").map(String::from).collect();
-
-    lines.retain(|line| {
-        if let Some((name, _)) = line.split_once(':') {
-            !name.trim().eq_ignore_ascii_case("authorization")
-        } else {
-            true
-        }
-    });
-
-    for line in lines.iter_mut() {
-        if let Some((name, _)) = line.split_once(':')
-            && name.trim().eq_ignore_ascii_case("host")
-        {
-            *line = format!("Host: {host}");
-        }
-    }
-
-    let auth_header = format!("Authorization: Bearer {api_key}");
-    if lines.len() > 1 {
-        lines.insert(1, auth_header);
-    }
-
-    let joined = lines.join("\r\n");
-    joined.into_bytes()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -972,29 +899,18 @@ mod tests {
     fn test_state() -> ProxyState {
         let ca = Arc::new(Ca::generate().unwrap());
         let server_config = ca.server_config(&["api.openai.com".to_string()]).unwrap();
+        let store = SessionStore::in_memory().unwrap();
         ProxyState {
             server_config,
             upstream_config: upstream_client_config().unwrap(),
-            allowlist: vec!["api.openai.com".to_string()],
-            api_key: "sk-REAL-KEY".into(),
             upstream_port: 0,
             upstream_host: String::new(),
             expected_vm_ip: "10.0.0.2".to_string(),
-            sessions: None,
+            sessions: store,
             secret_store: None,
             ca_cert_sha256: "00:11:22:33:44:55".to_string(),
             start_time: 0,
         }
-    }
-
-    #[test]
-    fn rewrite_poc_strips_client_auth_and_injects_real_key() {
-        let state = test_state();
-        let raw = b"GET /v1/models HTTP/1.1\r\nHost: api.openai.com\r\nAuthorization: Bearer PLACEHOLDER\r\n\r\n";
-        let out = rewrite_request_poc(raw, &state.api_key, "api.openai.com");
-        let s = String::from_utf8_lossy(&out);
-        assert!(s.contains("Authorization: Bearer sk-REAL-KEY"));
-        assert!(!s.contains("PLACEHOLDER"));
     }
 
     #[test]
@@ -1057,13 +973,6 @@ mod tests {
         let s = String::from_utf8_lossy(&out);
         assert!(s.contains("Host: api.upstream.com"));
         assert!(!s.contains("api.original.com"));
-    }
-
-    #[test]
-    fn allowlist_exact_match() {
-        let state = test_state();
-        assert!(is_allowlisted(&state, "api.openai.com"));
-        assert!(!is_allowlisted(&state, "evil.com"));
     }
 
     // --- WebSocket detection tests ---
@@ -1204,12 +1113,10 @@ mod integration_tests {
         let state = ProxyState {
             server_config,
             upstream_config,
-            allowlist: vec![],
-            api_key: String::new(),
             upstream_port: 0,
             upstream_host: String::new(),
             expected_vm_ip: String::new(),
-            sessions: Some(store),
+            sessions: store,
             secret_store: Some(secret_store),
             ca_cert_sha256: ca_fingerprint,
             start_time: crate::session::now_secs(),
