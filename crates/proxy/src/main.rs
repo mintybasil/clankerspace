@@ -30,8 +30,7 @@ async fn main() -> Result<()> {
 
     let ca = Arc::new(certs::Ca::generate()?);
 
-    let allowlist = vec!["api.openai.com".to_string()];
-    let server_config = ca.server_config(&allowlist)?;
+    let server_config = ca.server_config(&["api.openai.com".to_string()])?;
     let upstream_config = certs::Ca::upstream_client_config_no_verify()?;
 
     let ca_cert_sha256 = {
@@ -46,15 +45,15 @@ async fn main() -> Result<()> {
             .join(":")
     };
 
+    let session_store = session::SessionStore::in_memory()?;
+
     let proxy_state = proxy::ProxyState {
         server_config,
         upstream_config,
-        allowlist,
-        api_key: String::new(),
         upstream_port: 443,
         upstream_host: String::new(),
         expected_vm_ip: String::new(),
-        sessions: None,
+        sessions: session_store,
         secret_store: Some(secret_store),
         ca_cert_sha256,
         start_time: session::now_secs(),

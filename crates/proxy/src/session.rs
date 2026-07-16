@@ -53,7 +53,7 @@ pub struct AllowlistEntry {
     pub credential_ref: Option<String>,
 }
 
-/// A proxy session. Persisted to SQLite (minus `api_key` which is memory-only).
+/// A proxy session. Persisted to SQLite (minus memory-only fields).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Session {
     pub session_id: String,
@@ -62,9 +62,12 @@ pub struct Session {
     pub created_at: u64,         // Unix timestamp (seconds)
     pub expires_at: Option<u64>, // Unix timestamp (seconds), None = no expiry
 
-    /// API key held in memory only — never persisted to SQLite.
+    /// Dummy→real key map held in memory only — never persisted to SQLite.
+    /// Used for MITM key swapping. The proxy extracts the dummy key from the
+    /// agent's `Authorization` header, looks it up here, and replaces it with
+    /// the real key before forwarding upstream.
     #[serde(skip)]
-    pub api_key: Option<String>,
+    pub dummy_to_real: HashMap<String, String>,
 }
 
 /// REST API request body for `POST /sessions`.
@@ -213,7 +216,7 @@ impl SessionStore {
                     allowlist,
                     created_at: row.get::<_, i64>(3)? as u64,
                     expires_at: expires_at.map(|v| v as u64),
-                    api_key: None, // Not persisted — re-fetched from Vault on restart
+                    dummy_to_real: HashMap::new(),
                 })
             })?;
             rows.filter_map(|r| r.ok()).collect()
@@ -273,7 +276,7 @@ impl SessionStore {
             }
         }
 
-        // Persist to SQLite (without api_key)
+        // Persist to SQLite (without memory-only fields)
         let allowlist_json = serde_json::to_string(&session.allowlist)?;
         {
             let conn = self.conn.lock().unwrap();
@@ -291,8 +294,8 @@ impl SessionStore {
         }
 
         // Insert into in-memory map
-        // Ensure api_key is None (don't persist)
-        session.api_key = None;
+        // Ensure memory-only fields are cleared (don't persist)
+        session.dummy_to_real = HashMap::new();
         let mut map = self.sessions.lock().unwrap();
         map.insert(session.source_ip.clone(), session);
 
@@ -386,12 +389,12 @@ impl SessionStore {
         self.stats.lock().unwrap().get(session_id).cloned()
     }
 
-    /// Set the API key for a session (memory only, not persisted).
+    /// Set the dummy→real key map for a session (memory only, not persisted).
     #[allow(dead_code)]
-    pub fn set_api_key(&self, session_id: &str, api_key: String) -> bool {
+    pub fn set_key_map(&self, session_id: &str, dummy_to_real: HashMap<String, String>) -> bool {
         let mut map = self.sessions.lock().unwrap();
         if let Some(session) = map.values_mut().find(|s| s.session_id == session_id) {
-            session.api_key = Some(api_key);
+            session.dummy_to_real = dummy_to_real;
             true
         } else {
             false
@@ -450,7 +453,7 @@ mod tests {
             }],
             created_at: now_secs(),
             expires_at: Some(now_secs() + 3600),
-            api_key: Some("sk-test-key".to_string()),
+            dummy_to_real: HashMap::new(),
         }
     }
 
@@ -472,19 +475,6 @@ mod tests {
         // Get by source_ip (used in CONNECT handling)
         let by_ip = store.get_by_ip("10.0.1.42").expect("session should exist");
         assert_eq!(by_ip.session_id, "sess_001");
-    }
-
-    #[test]
-    fn test_api_key_not_persisted() {
-        let store = SessionStore::in_memory().unwrap();
-        let mut session = make_session("sess_key", "10.0.1.50");
-        session.api_key = Some("sk-secret".to_string());
-
-        store.create(session).unwrap();
-
-        // api_key should be None after create (not persisted)
-        let retrieved = store.get("sess_key").unwrap();
-        assert_eq!(retrieved.api_key, None);
     }
 
     #[test]
@@ -563,30 +553,67 @@ mod tests {
     }
 
     #[test]
-    fn test_set_api_key() {
+    fn test_set_key_map() {
         let store = SessionStore::in_memory().unwrap();
         store
-            .create(make_session("sess_apikey", "10.0.1.91"))
+            .create(make_session("sess_keymap", "10.0.1.92"))
             .unwrap();
 
-        // api_key is None after create
-        assert_eq!(store.get("sess_apikey").unwrap().api_key, None);
+        // dummy_to_real is empty after create
+        assert!(store.get("sess_keymap").unwrap().dummy_to_real.is_empty());
 
-        // Set API key (simulates Vault fetch after restart)
-        let set = store.set_api_key("sess_apikey", "sk-fetched".to_string());
+        // Set the dummy→real map
+        let mut map = HashMap::new();
+        map.insert("sk-dummy-1".to_string(), "sk-real-1".to_string());
+        map.insert("sk-dummy-2".to_string(), "sk-real-2".to_string());
+        let set = store.set_key_map("sess_keymap", map);
         assert!(set);
 
+        let session = store.get("sess_keymap").unwrap();
+        assert_eq!(session.dummy_to_real.len(), 2);
         assert_eq!(
-            store.get("sess_apikey").unwrap().api_key,
-            Some("sk-fetched".to_string())
+            session.dummy_to_real.get("sk-dummy-1"),
+            Some(&"sk-real-1".to_string())
+        );
+        assert_eq!(
+            session.dummy_to_real.get("sk-dummy-2"),
+            Some(&"sk-real-2".to_string())
         );
     }
 
     #[test]
-    fn test_set_api_key_nonexistent() {
+    fn test_set_key_map_nonexistent() {
         let store = SessionStore::in_memory().unwrap();
-        let set = store.set_api_key("nonexistent", "sk-key".to_string());
+        let map = HashMap::new();
+        let set = store.set_key_map("nonexistent", map);
         assert!(!set);
+    }
+
+    #[test]
+    fn test_key_map_not_persisted() {
+        let db_path = "/tmp/ae-poc-test-session-keymap-persist.sqlite";
+        let _ = std::fs::remove_file(db_path);
+
+        {
+            let store = SessionStore::open(db_path).unwrap();
+            store
+                .create(make_session("sess_km_persist", "10.0.1.140"))
+                .unwrap();
+
+            let mut map = HashMap::new();
+            map.insert("sk-dummy".to_string(), "sk-real".to_string());
+            store.set_key_map("sess_km_persist", map);
+            assert_eq!(store.get("sess_km_persist").unwrap().dummy_to_real.len(), 1);
+        }
+
+        // Reopen — dummy_to_real should be empty (not persisted)
+        {
+            let store = SessionStore::open(db_path).unwrap();
+            let session = store.get("sess_km_persist").unwrap();
+            assert!(session.dummy_to_real.is_empty());
+        }
+
+        let _ = std::fs::remove_file(db_path);
     }
 
     // --- SQLite persistence tests ---
@@ -617,8 +644,8 @@ mod tests {
             assert_eq!(session.allowlist.len(), 1);
             assert_eq!(session.allowlist[0].domain, "api.openai.com");
             assert_eq!(session.allowlist[0].mode, "mitm");
-            // api_key not persisted — must be None on recovery
-            assert_eq!(session.api_key, None);
+            // dummy_to_real not persisted — must be empty on recovery
+            assert!(session.dummy_to_real.is_empty());
         }
 
         let _ = std::fs::remove_file(db_path);
