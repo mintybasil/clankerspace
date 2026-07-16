@@ -251,17 +251,19 @@ impl ProxyService {
                     Err(RewriteError::UnknownDummyKey(key)) => {
                         tracing::warn!(host = %host, key = %key, "DROP: unknown dummy key in Authorization header");
                         let resp = b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n";
-                        if let Err(e) = tls_upstream.write_all(resp).await {
+                        if let Err(e) = tls_client.write_all(resp).await {
                             tracing::error!(host = %host, error = %e, "failed to write 403 to client");
                         }
+                        let _ = tls_client.shutdown().await;
                         return;
                     }
                     Err(RewriteError::NoAuthHeader) => {
                         tracing::warn!(host = %host, "DROP: no Authorization header in request");
                         let resp = b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n";
-                        if let Err(e) = tls_upstream.write_all(resp).await {
+                        if let Err(e) = tls_client.write_all(resp).await {
                             tracing::error!(host = %host, error = %e, "failed to write 403 to client");
                         }
+                        let _ = tls_client.shutdown().await;
                         return;
                     }
                 }
@@ -884,34 +886,6 @@ fn rewrite_request(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::certs::{Ca, CertError};
-
-    fn upstream_client_config() -> Result<Arc<rustls::ClientConfig>, CertError> {
-        let roots = rustls::RootCertStore {
-            roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
-        };
-        let config = rustls::ClientConfig::builder()
-            .with_root_certificates(roots)
-            .with_no_client_auth();
-        Ok(Arc::new(config))
-    }
-
-    fn test_state() -> ProxyState {
-        let ca = Arc::new(Ca::generate().unwrap());
-        let server_config = ca.server_config(&["api.openai.com".to_string()]).unwrap();
-        let store = SessionStore::in_memory().unwrap();
-        ProxyState {
-            server_config,
-            upstream_config: upstream_client_config().unwrap(),
-            upstream_port: 0,
-            upstream_host: String::new(),
-            expected_vm_ip: "10.0.0.2".to_string(),
-            sessions: store,
-            secret_store: None,
-            ca_cert_sha256: "00:11:22:33:44:55".to_string(),
-            start_time: 0,
-        }
-    }
 
     #[test]
     fn rewrite_dummy_to_real_swap() {
@@ -1399,6 +1373,347 @@ mod integration_tests {
         assert!(
             resp_str.contains("403"),
             "CONNECT should be 403 after delete: {resp_str}"
+        );
+    }
+
+    // --- MITM key-swap integration tests (issue #40) ---
+
+    /// A mock upstream TLS server that captures the forwarded request bytes.
+    ///
+    /// The proxy connects to this server as its upstream. The server accepts
+    /// one TLS connection, reads the HTTP request, stores it, and returns a
+    /// minimal HTTP response. The test then inspects `captured_request` to
+    /// verify the proxy performed the key swap correctly.
+    struct MockUpstream {
+        addr: std::net::SocketAddr,
+        captured_request: Arc<std::sync::Mutex<Option<Vec<u8>>>>,
+    }
+
+    impl MockUpstream {
+        /// Start a mock upstream TLS server on a random port.
+        ///
+        /// Returns the server handle. The caller should await `captured_request()`
+        /// after sending a request through the proxy.
+        async fn start() -> Self {
+            use rcgen::{CertificateParams, KeyPair, PKCS_ECDSA_P256_SHA256};
+
+            // Generate a self-signed cert for the mock upstream.
+            // The proxy uses NoVerifier so any cert is accepted.
+            let key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).unwrap();
+            let mut params = CertificateParams::new(vec!["api.openai.com".to_string()]).unwrap();
+            params.distinguished_name = {
+                let mut dn = rcgen::DistinguishedName::new();
+                dn.push(rcgen::DnType::CommonName, "api.openai.com");
+                dn
+            };
+            params.not_before = time::OffsetDateTime::now_utc() - time::Duration::days(1);
+            params.not_after = time::OffsetDateTime::now_utc() + time::Duration::days(7);
+            let cert = params.self_signed(&key).unwrap();
+
+            let cert_der: rustls::pki_types::CertificateDer<'static> = cert.der().clone();
+            let key_der = rustls::pki_types::PrivateKeyDer::Pkcs8(
+                rustls::pki_types::PrivatePkcs8KeyDer::from(key.serialize_der()),
+            );
+
+            let server_config = rustls::ServerConfig::builder()
+                .with_no_client_auth()
+                .with_single_cert(vec![cert_der], key_der)
+                .unwrap();
+            let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_config));
+
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+
+            let captured: Arc<std::sync::Mutex<Option<Vec<u8>>>> =
+                Arc::new(std::sync::Mutex::new(None));
+            let captured_clone = captured.clone();
+
+            tokio::spawn(async move {
+                if let Ok((stream, _)) = listener.accept().await {
+                    let acceptor = acceptor.clone();
+                    let captured = captured_clone.clone();
+                    tokio::spawn(async move {
+                        let mut tls = match acceptor.accept(stream).await {
+                            Ok(t) => t,
+                            Err(_) => return,
+                        };
+
+                        // Read the forwarded HTTP request
+                        let mut buf = vec![0u8; 8192];
+                        let n = tls.read(&mut buf).await.unwrap_or(0);
+                        if n > 0 {
+                            *captured.lock().unwrap() = Some(buf[..n].to_vec());
+                        }
+
+                        // Return a minimal HTTP response
+                        let _ = tls
+                            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                            .await;
+                        let _ = tls.flush().await;
+                        let _ = tls.shutdown().await;
+                    });
+                }
+            });
+
+            MockUpstream {
+                addr,
+                captured_request: captured,
+            }
+        }
+
+        /// Get the captured request bytes (if the upstream received a request).
+        fn captured_request(&self) -> Option<Vec<u8>> {
+            self.captured_request.lock().unwrap().clone()
+        }
+    }
+
+    /// Build a rustls client config that trusts the proxy's generated CA.
+    /// This lets the test client complete the MITM TLS handshake.
+    fn mitm_client_config(
+        ca_der: &rustls::pki_types::CertificateDer<'static>,
+    ) -> Arc<rustls::ClientConfig> {
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(ca_der.clone()).unwrap();
+        Arc::new(
+            rustls::ClientConfig::builder()
+                .with_root_certificates(roots)
+                .with_no_client_auth(),
+        )
+    }
+
+    /// Start a proxy that points at a mock upstream server.
+    /// Returns the test proxy handle and the CA cert (for the client TLS config).
+    async fn start_test_proxy_with_upstream(
+        secret_store: Arc<dyn crate::vault::SecretStore>,
+        upstream_addr: std::net::SocketAddr,
+    ) -> (TestProxy, rustls::pki_types::CertificateDer<'static>) {
+        let ca = Arc::new(Ca::generate().unwrap());
+        let server_config = ca.server_config(&["api.openai.com".to_string()]).unwrap();
+        let upstream_config = Ca::upstream_client_config_no_verify().unwrap();
+
+        let mut hasher = Sha256::new();
+        hasher.update(ca.ca_der.as_ref());
+        let ca_fingerprint: String = hasher
+            .finalize()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<Vec<_>>()
+            .join(":");
+
+        let store = SessionStore::in_memory().unwrap();
+
+        let state = ProxyState {
+            server_config,
+            upstream_config,
+            upstream_port: upstream_addr.port(),
+            upstream_host: upstream_addr.ip().to_string(),
+            expected_vm_ip: String::new(),
+            sessions: store,
+            secret_store: Some(secret_store),
+            ca_cert_sha256: ca_fingerprint,
+            start_time: crate::session::now_secs(),
+        };
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let tcp_state = state.clone();
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                let st = tcp_state.clone();
+                tokio::spawn(async move {
+                    let _ = handle_connection(stream, st).await;
+                });
+            }
+        });
+
+        let socket_path = format!("/tmp/ae-test-{}-{}.sock", std::process::id(), addr.port());
+        std::fs::remove_file(&socket_path).ok();
+        let unix_listener = tokio::net::UnixListener::bind(&socket_path).unwrap();
+
+        let unix_state = state.clone();
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = unix_listener.accept().await {
+                let st = unix_state.clone();
+                tokio::spawn(async move {
+                    let _ = handle_session_connection(stream, st).await;
+                });
+            }
+        });
+
+        let ca_der = ca.ca_der.clone();
+        (
+            TestProxy {
+                tcp_addr: addr,
+                socket_path,
+            },
+            ca_der,
+        )
+    }
+
+    /// Register a session with a mitm-mode allowlist entry and credential_ref.
+    async fn register_mitm_session(proxy: &TestProxy, session_id: &str, credential_ref: &str) {
+        let body = format!(
+            r#"{{"session_id":"{}","source_ip":"127.0.0.1","allowlist":[{{"domain":"api.openai.com","mode":"mitm","credential_ref":"{}"}}]}}"#,
+            session_id, credential_ref
+        );
+        let req = format!(
+            "POST /sessions HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        let resp = http_request_unix(&proxy.socket_path, &req).await;
+        assert!(
+            String::from_utf8_lossy(&resp).contains("201"),
+            "session creation should succeed: {}",
+            String::from_utf8_lossy(&resp)
+        );
+    }
+
+    /// Send a CONNECT request, complete the MITM TLS handshake, and send an
+    /// HTTP request through the tunnel. Returns the HTTP response from upstream.
+    async fn connect_and_send_request(
+        proxy: &TestProxy,
+        ca_der: &rustls::pki_types::CertificateDer<'static>,
+        http_request: &str,
+    ) -> Vec<u8> {
+        // 1. Connect to the proxy's TCP port
+        let mut tcp = tokio::net::TcpStream::connect(proxy.tcp_addr).await.unwrap();
+
+        // 2. Send CONNECT (without Connection: close — the connection must stay open for upgrade)
+        tcp.write_all(b"CONNECT api.openai.com:443 HTTP/1.1\r\nHost: api.openai.com:443\r\n\r\n")
+            .await
+            .unwrap();
+        tcp.flush().await.unwrap();
+
+        // 3. Read the CONNECT response (200 OK)
+        let mut buf = vec![0u8; 4096];
+        let n = tcp.read(&mut buf).await.unwrap();
+        let connect_resp = String::from_utf8_lossy(&buf[..n]);
+        assert!(
+            connect_resp.starts_with("HTTP/1.1 200"),
+            "CONNECT should succeed: {connect_resp}"
+        );
+
+        // 4. Start TLS handshake on the same connection (MITM side)
+        //    The proxy presents a leaf cert signed by its CA, which we trust.
+        let client_config = mitm_client_config(ca_der);
+        let connector = tokio_rustls::TlsConnector::from(client_config);
+        let server_name = rustls::pki_types::ServerName::try_from("api.openai.com").unwrap();
+        let mut tls = connector.connect(server_name, tcp).await.unwrap();
+
+        // 5. Send the HTTP request through the TLS tunnel
+        tls.write_all(http_request.as_bytes()).await.unwrap();
+        tls.flush().await.unwrap();
+
+        // 6. Read the response (from the mock upstream, through the proxy)
+        let mut resp = Vec::new();
+        let _ = tls.read_to_end(&mut resp).await;
+        resp
+    }
+
+    #[tokio::test]
+    async fn test_mitm_key_swap() {
+        let secret_store = Arc::new(MockSecretStore::new());
+        secret_store.insert(
+            "vault://secret/data/openai-key",
+            "sk-dummy-test",
+            "sk-real-test",
+        );
+
+        let upstream = MockUpstream::start().await;
+        let (proxy, ca_der) = start_test_proxy_with_upstream(secret_store, upstream.addr).await;
+
+        // Register a session with a credential_ref
+        register_mitm_session(&proxy, "sess_mitm_swap", "vault://secret/data/openai-key").await;
+
+        // Send a request with the dummy key through the MITM tunnel
+        let request = "GET /v1/models HTTP/1.1\r\nHost: api.openai.com\r\nAuthorization: Bearer sk-dummy-test\r\nConnection: close\r\n\r\n";
+        let resp = connect_and_send_request(&proxy, &ca_der, request).await;
+
+        // The mock upstream returns "ok" — verify we got a response
+        let resp_str = String::from_utf8_lossy(&resp);
+        assert!(
+            resp_str.contains("200 OK") || resp_str.contains("ok"),
+            "should get response from upstream: {resp_str}"
+        );
+
+        // Verify the upstream received the REAL key (not the dummy)
+        let captured = upstream
+            .captured_request()
+            .expect("upstream should have received a request");
+        let captured_str = String::from_utf8_lossy(&captured);
+        assert!(
+            captured_str.contains("Authorization: Bearer sk-real-test"),
+            "upstream should receive the real key: {captured_str}"
+        );
+        assert!(
+            !captured_str.contains("sk-dummy-test"),
+            "upstream should NOT see the dummy key: {captured_str}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_mitm_unknown_dummy_key_403() {
+        let secret_store = Arc::new(MockSecretStore::new());
+        secret_store.insert(
+            "vault://secret/data/openai-key",
+            "sk-dummy-known",
+            "sk-real-known",
+        );
+
+        let upstream = MockUpstream::start().await;
+        let (proxy, ca_der) = start_test_proxy_with_upstream(secret_store, upstream.addr).await;
+
+        register_mitm_session(&proxy, "sess_mitm_unknown", "vault://secret/data/openai-key").await;
+
+        // Send a request with an unknown dummy key
+        let request = "GET /v1/models HTTP/1.1\r\nHost: api.openai.com\r\nAuthorization: Bearer sk-dummy-unknown\r\nConnection: close\r\n\r\n";
+        let resp = connect_and_send_request(&proxy, &ca_der, request).await;
+
+        // The proxy should return 403 (not forward to upstream)
+        let resp_str = String::from_utf8_lossy(&resp);
+        assert!(
+            resp_str.contains("403"),
+            "proxy should return 403 for unknown dummy key: {resp_str}"
+        );
+
+        // Upstream should not have received anything
+        assert!(
+            upstream.captured_request().is_none(),
+            "upstream should not receive a request for unknown dummy key"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_mitm_no_auth_header_403() {
+        let secret_store = Arc::new(MockSecretStore::new());
+        secret_store.insert(
+            "vault://secret/data/openai-key",
+            "sk-dummy-test",
+            "sk-real-test",
+        );
+
+        let upstream = MockUpstream::start().await;
+        let (proxy, ca_der) = start_test_proxy_with_upstream(secret_store, upstream.addr).await;
+
+        register_mitm_session(&proxy, "sess_mitm_noauth", "vault://secret/data/openai-key").await;
+
+        // Send a request with no Authorization header
+        let request = "GET /v1/models HTTP/1.1\r\nHost: api.openai.com\r\nConnection: close\r\n\r\n";
+        let resp = connect_and_send_request(&proxy, &ca_der, request).await;
+
+        // The proxy should return 403
+        let resp_str = String::from_utf8_lossy(&resp);
+        assert!(
+            resp_str.contains("403"),
+            "proxy should return 403 for missing Authorization header: {resp_str}"
+        );
+
+        // Upstream should not have received anything
+        assert!(
+            upstream.captured_request().is_none(),
+            "upstream should not receive a request with no auth header"
         );
     }
 }
